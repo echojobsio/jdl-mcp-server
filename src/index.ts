@@ -11,10 +11,20 @@ const isFreeMode = apiKey === MCP_FREE_KEY;
 
 const client = new JDLClient(apiKey);
 
+const CONTINENT_MAP: Record<string, string> = {
+  'europe': 'DE,GB,FR,NL,ES,IT,SE,PL,IE,CH,AT,BE,DK,NO,FI,PT,CZ,RO,HU,GR',
+  'asia': 'JP,CN,IN,KR,SG,TW,HK,TH,VN,PH,MY,ID',
+  'latin america': 'BR,MX,AR,CO,CL,PE,UY',
+  'latam': 'BR,MX,AR,CO,CL,PE,UY',
+  'middle east': 'AE,IL,SA,QA,BH,KW',
+  'africa': 'ZA,NG,KE,GH,EG',
+  'oceania': 'AU,NZ',
+};
+
 function formatSalary(min: number | undefined, max: number | undefined): string {
-  // Filter out obviously wrong values (non-USD not converted properly)
-  const validMin = min && min >= 10 ? min : undefined;
-  const validMax = max && max >= 10 ? max : undefined;
+  // Filter out obviously wrong values (non-USD or absurd amounts)
+  const validMin = min && min >= 10 && min <= 1000 ? min : undefined;
+  const validMax = max && max >= 10 && max <= 1000 ? max : undefined;
   if (!validMin && !validMax) return 'Not disclosed';
   return `$${validMin || '?'}k - $${validMax || '?'}k`;
 }
@@ -31,7 +41,7 @@ const server = new McpServer({
   version: '1.0.0',
 }, {
   capabilities: { tools: {} },
-  instructions: 'JobDataLake MCP server provides access to 1M+ enriched job listings from 20,000+ companies. Use search_jobs for keyword/filter searches, get_job for full job details, get_company for company info, and find_similar_jobs for vector similarity. Each tool call uses 1 API credit.',
+  instructions: 'JobDataLake MCP server — 1,080,000+ enriched job listings from 20,000+ companies across 40+ ATS platforms, updated hourly. Tools: search_jobs (keyword/filter search with salary, skills, location, date, seniority filters), get_job (full job detail + description), get_company (company profile), find_similar_jobs (vector similarity for remote/tech jobs), get_filter_options (discover available filter values). Location supports continents (Europe, Asia, Latin America) and ISO country codes. Salary is in thousands (150 = $150k). Free tier: 500 calls/day, unlimited with your own API key from jobdatalake.com.',
 });
 
 // --- search_jobs ---
@@ -52,6 +62,7 @@ server.tool(
     skills: z.string().optional().describe('Comma-separated required skills, e.g. "Python,AWS,Kubernetes"'),
     company: z.string().optional().describe('Company domain filter, e.g. "stripe.com"'),
     posted_within: z.string().optional().describe('Time window: "24h", "7d", "30d" — only jobs posted within this period'),
+    sort_by: z.string().optional().describe('Sort: "posted_at:desc" (newest, default), "posted_at:asc" (oldest), "salary_max_usd:desc" (highest paid)'),
     page: z.number().optional().default(1),
     per_page: z.number().optional().default(20).describe('Results per page (max 100)'),
   },
@@ -59,7 +70,15 @@ server.tool(
     const params: Record<string, string> = {};
     if (args.query) params.q = args.query;
     if (args.semantic_query) params.semantic_query = args.semantic_query;
-    if (args.location) params.location = args.location;
+    if (args.location) {
+      // Map continent names to ISO country codes
+      const continent = CONTINENT_MAP[args.location.toLowerCase()];
+      if (continent) {
+        params.countries = continent;
+      } else {
+        params.location = args.location;
+      }
+    }
     if (args.remote_type) params.remote_type = args.remote_type;
     if (args.countries) params.countries = args.countries;
     if (args.job_function) params.job_function = args.job_function;
@@ -70,6 +89,7 @@ server.tool(
     if (args.salary_max) params.salary_max = String(args.salary_max >= 1000 ? Math.round(args.salary_max / 1000) : args.salary_max);
     if (args.skills) params.skills = args.skills;
     if (args.company) params.domain = args.company;
+    if (args.sort_by) params.sort_by = args.sort_by;
     if (args.posted_within) {
       const match = args.posted_within.match(/^(\d+)(h|d)$/);
       if (match) {
@@ -94,15 +114,20 @@ server.tool(
         remote: j.remote_type || 'Not specified',
         salary: formatSalary(j.salary_min_usd, j.salary_max_usd),
         seniority: j.seniority?.join(', ') || 'Not specified',
-        skills: j.required_skills?.join(', ') || '',
+        skills: (j.required_skills || []).slice(0, 15).join(', ') + (j.required_skills?.length > 15 ? '...' : ''),
         posted: j.posted_at ? new Date(j.posted_at < 1e12 ? j.posted_at * 1000 : j.posted_at).toLocaleDateString() : '',
         apply_url: j.url || '',
         job_handle: j.job_handle || '',
       }));
 
-      let text = `Found ${data.found?.toLocaleString()} jobs (showing ${jobs.length}):\n\n${jobs.map((j: any, i: number) =>
-        `${i + 1}. **${j.title}** at ${j.company}\n   ${j.location} | ${j.remote} | ${j.salary}\n   Skills: ${j.skills}\n   Apply: ${j.apply_url}\n   ID: ${j.job_handle}`
-      ).join('\n\n')}`;
+      let text: string;
+      if (jobs.length === 0) {
+        text = `No jobs found matching your filters. Try:\n- Removing the salary filter (many jobs don't disclose salary)\n- Broadening the location or remote type\n- Using fewer skill filters\n- Expanding the date range`;
+      } else {
+        text = `Found ${data.found?.toLocaleString()} jobs (showing ${jobs.length}):\n\n${jobs.map((j: any, i: number) =>
+          `${i + 1}. **${j.title}** at ${j.company}\n   ${j.location} | ${j.remote} | ${j.salary}\n   Skills: ${j.skills}\n   Apply: ${j.apply_url}\n   ID: ${j.job_handle}`
+        ).join('\n\n')}`;
+      }
 
       text += mcpWarning(result.mcpRemaining);
 
