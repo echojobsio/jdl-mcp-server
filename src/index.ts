@@ -5,14 +5,18 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { JDLClient } from './client.js';
 
-const apiKey = process.env.JDL_API_KEY;
-if (!apiKey) {
-  console.error('Error: JDL_API_KEY environment variable is required.');
-  console.error('Get a free API key at https://www.jobdatalake.com');
-  process.exit(1);
-}
+const MCP_FREE_KEY = 'jdl_mcp_free_1acbcbd08671a764833c21b4446ee3d6';
+const apiKey = process.env.JDL_API_KEY || MCP_FREE_KEY;
+const isFreeMode = apiKey === MCP_FREE_KEY;
 
 const client = new JDLClient(apiKey);
+
+function mcpWarning(remaining?: number): string {
+  if (!isFreeMode || remaining === undefined) return '';
+  if (remaining <= 0) return '\n\n⚠️ Daily free limit reached. Get unlimited access with your own API key at jobdatalake.com';
+  if (remaining <= 50) return `\n\n⚠️ ${remaining} free requests remaining today. Get unlimited access at jobdatalake.com`;
+  return '';
+}
 
 const server = new McpServer({
   name: 'jobdatalake',
@@ -62,7 +66,8 @@ server.tool(
     if (!params.q && !params.semantic_query) params.q = '*';
 
     try {
-      const data = await client.searchJobs(params);
+      const result = await client.searchJobs(params);
+      const data = result.data;
       const jobs = (data.jobs || []).map((j: any) => ({
         title: j.title,
         company: j.company_name,
@@ -78,14 +83,13 @@ server.tool(
         job_handle: j.job_handle || '',
       }));
 
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Found ${data.found?.toLocaleString()} jobs (showing ${jobs.length}):\n\n${jobs.map((j: any, i: number) =>
-            `${i + 1}. **${j.title}** at ${j.company}\n   ${j.location} | ${j.remote} | ${j.salary}\n   Skills: ${j.skills}\n   ${j.apply_url}`
-          ).join('\n\n')}`,
-        }],
-      };
+      let text = `Found ${data.found?.toLocaleString()} jobs (showing ${jobs.length}):\n\n${jobs.map((j: any, i: number) =>
+        `${i + 1}. **${j.title}** at ${j.company}\n   ${j.location} | ${j.remote} | ${j.salary}\n   Skills: ${j.skills}\n   ${j.apply_url}`
+      ).join('\n\n')}`;
+
+      text += mcpWarning(result.mcpRemaining);
+
+      return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
       return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
     }
@@ -101,24 +105,24 @@ server.tool(
   },
   async (args) => {
     try {
-      const job = await client.getJob(args.job_id);
+      const result = await client.getJob(args.job_id);
+      const job = result.data;
       const salary = job.salary_min || job.salary_max
         ? `$${job.salary_min?.toLocaleString() || '?'} - $${job.salary_max?.toLocaleString() || '?'}`
         : 'Not disclosed';
 
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `**${job.title}** at ${job.company?.name || job.company_name || 'Unknown'}\n\n` +
-            `Location: ${job.locations?.join(', ') || 'Not specified'}\n` +
-            `Salary: ${salary}\n` +
-            `Seniority: ${job.seniority?.join(', ') || 'Not specified'}\n` +
-            `Skills: ${job.required_skills?.join(', ') || 'Not specified'}\n` +
-            `Type: ${job.employment_type || 'Not specified'}\n` +
-            `Apply: ${job.url || 'Not available'}\n\n` +
-            `---\n\n${job.description || 'No description available.'}`,
-        }],
-      };
+      let text = `**${job.title}** at ${job.company?.name || job.company_name || 'Unknown'}\n\n` +
+        `Location: ${job.locations?.join(', ') || 'Not specified'}\n` +
+        `Salary: ${salary}\n` +
+        `Seniority: ${job.seniority?.join(', ') || 'Not specified'}\n` +
+        `Skills: ${job.required_skills?.join(', ') || 'Not specified'}\n` +
+        `Type: ${job.employment_type || 'Not specified'}\n` +
+        `Apply: ${job.url || 'Not available'}\n\n` +
+        `---\n\n${job.description || 'No description available.'}`;
+
+      text += mcpWarning(result.mcpRemaining);
+
+      return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
       return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
     }
@@ -134,18 +138,18 @@ server.tool(
   },
   async (args) => {
     try {
-      const company = await client.getCompany(args.company);
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `**${company.name}** (${company.domain_name})\n\n` +
-            `Industry: ${company.industry?.join(', ') || 'Not specified'}\n` +
-            `Size: ${company.employee_count || 'Not specified'}\n` +
-            `Funding: ${company.funding || 'Not specified'}\n` +
-            `Career page: ${company.career_url || 'Not available'}\n` +
-            `Open jobs: ${company.job_count || 'Unknown'}`,
-        }],
-      };
+      const result = await client.getCompany(args.company);
+      const company = result.data;
+      let text = `**${company.name}** (${company.domain_name})\n\n` +
+        `Industry: ${company.industry?.join(', ') || 'Not specified'}\n` +
+        `Size: ${company.employee_count || 'Not specified'}\n` +
+        `Funding: ${company.funding || 'Not specified'}\n` +
+        `Career page: ${company.career_url || 'Not available'}\n` +
+        `Open jobs: ${company.job_count || 'Unknown'}`;
+
+      text += mcpWarning(result.mcpRemaining);
+
+      return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
       return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
     }
@@ -166,8 +170,8 @@ server.tool(
         similar_to: args.job_id,
         per_page: String(Math.min(args.per_page ?? 10, 50)),
       };
-      const data = await client.searchJobs(params);
-      const jobs = (data.jobs || []).map((j: any) => ({
+      const result = await client.searchJobs(params);
+      const jobs = (result.data.jobs || []).map((j: any) => ({
         title: j.title,
         company: j.company_name,
         location: j.locations?.join(', ') || '',
@@ -178,14 +182,13 @@ server.tool(
         job_handle: j.job_handle || '',
       }));
 
-      return {
-        content: [{
-          type: 'text' as const,
-          text: `Found ${jobs.length} similar jobs:\n\n${jobs.map((j: any, i: number) =>
-            `${i + 1}. **${j.title}** at ${j.company} — ${j.salary} ${j.score}`
-          ).join('\n')}`,
-        }],
-      };
+      let text = `Found ${jobs.length} similar jobs:\n\n${jobs.map((j: any, i: number) =>
+        `${i + 1}. **${j.title}** at ${j.company} — ${j.salary} ${j.score}`
+      ).join('\n')}`;
+
+      text += mcpWarning(result.mcpRemaining);
+
+      return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
       return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
     }
