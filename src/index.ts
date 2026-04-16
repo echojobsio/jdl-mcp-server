@@ -32,7 +32,7 @@ server.tool(
   'Search 1M+ job listings from 20K+ companies. Supports keyword search, AI semantic search, filters for location, salary, remote type, seniority, skills, and more.',
   {
     query: z.string().optional().describe('Keyword search (title, company, skills). Use * for all jobs.'),
-    semantic_query: z.string().optional().describe('Natural language search, e.g. "backend engineer at a climate tech startup"'),
+    semantic_query: z.string().optional().describe('AI semantic search. Works best with job-title-like queries (e.g. "machine learning engineer", "senior devops"). Supported for remote + tech jobs only.'),
     location: z.string().optional().describe('Location filter, e.g. "Remote", "San Francisco", "Germany"'),
     remote_type: z.enum(['fully_remote', 'hybrid', 'on_site']).optional().describe('Remote work policy'),
     countries: z.string().optional().describe('Comma-separated ISO country codes, e.g. "US,GB,DE"'),
@@ -56,8 +56,9 @@ server.tool(
     if (args.job_function) params.job_function = args.job_function;
     if (args.seniority) params.seniority = args.seniority;
     if (args.employment_type) params.employment_type = args.employment_type;
-    if (args.salary_min) params.salary_min = String(args.salary_min);
-    if (args.salary_max) params.salary_max = String(args.salary_max);
+    // API uses salary in thousands (150 = $150K), convert if user passes full dollars
+    if (args.salary_min) params.salary_min = String(args.salary_min >= 1000 ? Math.round(args.salary_min / 1000) : args.salary_min);
+    if (args.salary_max) params.salary_max = String(args.salary_max >= 1000 ? Math.round(args.salary_max / 1000) : args.salary_max);
     if (args.skills) params.skills = args.skills;
     if (args.company) params.domain = args.company;
     params.page = String(args.page ?? 1);
@@ -84,7 +85,7 @@ server.tool(
       }));
 
       let text = `Found ${data.found?.toLocaleString()} jobs (showing ${jobs.length}):\n\n${jobs.map((j: any, i: number) =>
-        `${i + 1}. **${j.title}** at ${j.company}\n   ${j.location} | ${j.remote} | ${j.salary}\n   Skills: ${j.skills}\n   ${j.apply_url}`
+        `${i + 1}. **${j.title}** at ${j.company}\n   ${j.location} | ${j.remote} | ${j.salary}\n   Skills: ${j.skills}\n   Apply: ${j.apply_url}\n   ID: ${j.job_handle}`
       ).join('\n\n')}`;
 
       text += mcpWarning(result.mcpRemaining);
@@ -99,9 +100,9 @@ server.tool(
 // --- get_job ---
 server.tool(
   'get_job',
-  'Get full details for a specific job listing including description, requirements, salary, and apply link.',
+  'Get full details for a specific job listing including description, requirements, salary, and apply link. Use the job_handle ID from search_jobs results.',
   {
-    job_id: z.string().describe('Job handle or ID'),
+    job_id: z.string().describe('Job handle from search results (e.g. "dropbox-senior-full-stack-software-engineer-d3f1k")'),
   },
   async (args) => {
     try {
