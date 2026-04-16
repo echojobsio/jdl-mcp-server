@@ -11,6 +11,14 @@ const isFreeMode = apiKey === MCP_FREE_KEY;
 
 const client = new JDLClient(apiKey);
 
+function formatSalary(min: number | undefined, max: number | undefined): string {
+  // Filter out obviously wrong values (non-USD not converted properly)
+  const validMin = min && min >= 10 ? min : undefined;
+  const validMax = max && max >= 10 ? max : undefined;
+  if (!validMin && !validMax) return 'Not disclosed';
+  return `$${validMin || '?'}k - $${validMax || '?'}k`;
+}
+
 function mcpWarning(remaining?: number): string {
   if (!isFreeMode || remaining === undefined) return '';
   if (remaining <= 0) return '\n\n⚠️ Daily free limit reached. Get unlimited access with your own API key at jobdatalake.com';
@@ -37,12 +45,13 @@ server.tool(
     remote_type: z.enum(['fully_remote', 'hybrid', 'on_site']).optional().describe('Remote work policy'),
     countries: z.string().optional().describe('Comma-separated ISO country codes, e.g. "US,GB,DE"'),
     job_function: z.enum(['eng', 'data', 'design', 'sales', 'ops', 'marketing', 'security', 'product', 'finance', 'hr', 'legal', 'other']).optional(),
-    seniority: z.string().optional().describe('Comma-separated: junior, mid, senior, staff, principal'),
+    seniority: z.string().optional().describe('Comma-separated: Entry, Mid Level, Senior, Staff, Principal, Manager, Internship, Director, Lead, C Level'),
     employment_type: z.enum(['full_time', 'part_time', 'contract', 'internship']).optional(),
     salary_min: z.number().optional().describe('Minimum annual salary in USD'),
     salary_max: z.number().optional().describe('Maximum annual salary in USD'),
     skills: z.string().optional().describe('Comma-separated required skills, e.g. "Python,AWS,Kubernetes"'),
     company: z.string().optional().describe('Company domain filter, e.g. "stripe.com"'),
+    posted_within: z.string().optional().describe('Time window: "24h", "7d", "30d" — only jobs posted within this period'),
     page: z.number().optional().default(1),
     per_page: z.number().optional().default(20).describe('Results per page (max 100)'),
   },
@@ -61,6 +70,15 @@ server.tool(
     if (args.salary_max) params.salary_max = String(args.salary_max >= 1000 ? Math.round(args.salary_max / 1000) : args.salary_max);
     if (args.skills) params.skills = args.skills;
     if (args.company) params.domain = args.company;
+    if (args.posted_within) {
+      const match = args.posted_within.match(/^(\d+)(h|d)$/);
+      if (match) {
+        const amount = parseInt(match[1]);
+        const unit = match[2];
+        const ms = unit === 'h' ? amount * 3600 * 1000 : amount * 86400 * 1000;
+        params.posted_after = String(Date.now() - ms);
+      }
+    }
     params.page = String(args.page ?? 1);
     params.per_page = String(Math.min(args.per_page ?? 20, 100));
 
@@ -74,9 +92,7 @@ server.tool(
         company: j.company_name,
         location: j.locations?.join(', ') || 'Not specified',
         remote: j.remote_type || 'Not specified',
-        salary: j.salary_min_usd || j.salary_max_usd
-          ? `$${j.salary_min_usd?.toLocaleString() || '?'} - $${j.salary_max_usd?.toLocaleString() || '?'}`
-          : 'Not disclosed',
+        salary: formatSalary(j.salary_min_usd, j.salary_max_usd),
         seniority: j.seniority?.join(', ') || 'Not specified',
         skills: j.required_skills?.join(', ') || '',
         posted: j.posted_at ? new Date(j.posted_at < 1e12 ? j.posted_at * 1000 : j.posted_at).toLocaleDateString() : '',
@@ -108,9 +124,7 @@ server.tool(
     try {
       const result = await client.getJob(args.job_id);
       const job = result.data;
-      const salary = job.salary_min || job.salary_max
-        ? `$${job.salary_min?.toLocaleString() || '?'} - $${job.salary_max?.toLocaleString() || '?'}`
-        : 'Not disclosed';
+      const salary = formatSalary(job.salary_min, job.salary_max);
 
       let text = `**${job.title}** at ${job.company?.name || job.company_name || 'Unknown'}\n\n` +
         `Location: ${job.locations?.join(', ') || 'Not specified'}\n` +
@@ -176,9 +190,7 @@ server.tool(
         title: j.title,
         company: j.company_name,
         location: j.locations?.join(', ') || '',
-        salary: j.salary_min_usd || j.salary_max_usd
-          ? `$${j.salary_min_usd?.toLocaleString() || '?'} - $${j.salary_max_usd?.toLocaleString() || '?'}`
-          : 'Not disclosed',
+        salary: formatSalary(j.salary_min_usd, j.salary_max_usd),
         score: j.vector_score ? `${(j.vector_score * 100).toFixed(0)}% match` : '',
         job_handle: j.job_handle || '',
       }));
@@ -189,6 +201,35 @@ server.tool(
 
       text += mcpWarning(result.mcpRemaining);
 
+      return { content: [{ type: 'text' as const, text }] };
+    } catch (e: any) {
+      if (e.message?.includes('embedding')) {
+        return { content: [{ type: 'text' as const, text: 'This job doesn\'t have vector embeddings yet. Similar job search is only available for remote and tech jobs. Try using search_jobs with similar keywords instead.' }] };
+      }
+      return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
+    }
+  }
+);
+
+// --- get_filter_options ---
+server.tool(
+  'get_filter_options',
+  'Get available filter values (seniority levels, job functions, skills, etc.) with job counts. Useful for discovering what values to use in search filters.',
+  {
+    facets: z.string().optional().default('seniority,job_function,remote_type,employment_type,required_skills').describe('Comma-separated facet fields to retrieve'),
+  },
+  async (args) => {
+    try {
+      const result = await client.searchJobs({ q: '*', per_page: '0', facets: args.facets ?? 'seniority,job_function,remote_type,employment_type,required_skills' });
+      const facets = result.data.facets || {};
+      let text = 'Available filter values:\n';
+      for (const [field, values] of Object.entries(facets)) {
+        text += `\n**${field}:**\n`;
+        for (const v of values as any[]) {
+          text += `  - ${v.value} (${v.count.toLocaleString()} jobs)\n`;
+        }
+      }
+      text += mcpWarning(result.mcpRemaining);
       return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
       return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
