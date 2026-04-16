@@ -62,7 +62,7 @@ server.tool(
     skills: z.string().optional().describe('Comma-separated required skills, e.g. "Python,AWS,Kubernetes"'),
     company: z.string().optional().describe('Company domain filter, e.g. "stripe.com"'),
     posted_within: z.string().optional().describe('Time window: "24h", "7d", "30d" — only jobs posted within this period'),
-    sort_by: z.string().optional().describe('Sort: "posted_at:desc" (newest, default), "posted_at:asc" (oldest), "salary_max_usd:desc" (highest paid)'),
+    sort_by: z.string().optional().describe('Sort: "posted_at:desc" (newest, default), "posted_at:asc" (oldest), "salary_max_usd:desc" (highest paid), "salary_min_usd:asc" (lowest paid)'),
     page: z.number().optional().default(1),
     per_page: z.number().optional().default(20).describe('Results per page (max 100)'),
   },
@@ -180,7 +180,8 @@ server.tool(
     try {
       const result = await client.getCompany(args.company);
       const company = result.data;
-      let text = `**${company.name}** (${company.domain_name})\n\n` +
+      const companyName = company.name || company.profile_name || company.handle || 'Unknown';
+      let text = `**${companyName}** (${company.domain || company.domain_name})\n\n` +
         `Industry: ${company.industry?.join(', ') || 'Not specified'}\n` +
         `Size: ${company.employee_count || 'Not specified'}\n` +
         `Funding: ${company.funding || 'Not specified'}\n` +
