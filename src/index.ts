@@ -19,6 +19,12 @@ const CONTINENT_MAP: Record<string, string> = {
   'middle east': 'AE,IL,SA,QA,BH,KW',
   'africa': 'ZA,NG,KE,GH,EG',
   'oceania': 'AU,NZ',
+  'southeast asia': 'SG,TH,PH,MY,VN,ID,MM,KH,LA',
+  'scandinavia': 'SE,NO,DK,FI,IS',
+  'south america': 'BR,AR,CO,CL,PE,UY,EC,VE,BO,PY',
+  'nordics': 'SE,NO,DK,FI,IS',
+  'apac': 'JP,CN,IN,KR,SG,TW,HK,TH,VN,PH,MY,ID,AU,NZ',
+  'emea': 'DE,GB,FR,NL,ES,IT,SE,PL,IE,CH,AT,BE,DK,NO,FI,PT,CZ,RO,HU,GR,AE,IL,SA,ZA,NG,KE,EG',
 };
 
 function formatSalary(min: number | undefined, max: number | undefined): string {
@@ -89,7 +95,13 @@ server.tool(
     if (args.salary_max) params.salary_max = String(args.salary_max >= 1000 ? Math.round(args.salary_max / 1000) : args.salary_max);
     if (args.skills) params.skills = args.skills;
     if (args.company) params.domain = args.company;
-    if (args.sort_by) params.sort_by = args.sort_by;
+    if (args.sort_by) {
+      params.sort_by = args.sort_by;
+      // When sorting by salary, exclude jobs with no salary to avoid NULL values at top
+      if (args.sort_by.includes('salary') && !params.salary_min) {
+        params.salary_min = '1';
+      }
+    }
     if (args.posted_within) {
       const match = args.posted_within.match(/^(\d+)(h|d)$/);
       if (match) {
@@ -120,16 +132,14 @@ server.tool(
         job_handle: j.job_handle || '',
       }));
 
-      let text: string;
+      let text = mcpWarning(result.mcpRemaining);
       if (jobs.length === 0) {
-        text = `No jobs found matching your filters. Try:\n- Removing the salary filter (many jobs don't disclose salary)\n- Broadening the location or remote type\n- Using fewer skill filters\n- Expanding the date range`;
+        text += `No jobs found matching your filters. Try:\n- Removing the salary filter (many jobs don't disclose salary)\n- Broadening the location or remote type\n- Using fewer skill filters\n- Expanding the date range`;
       } else {
-        text = `Found ${data.found?.toLocaleString()} jobs (showing ${jobs.length}):\n\n${jobs.map((j: any, i: number) =>
+        text += `Found ${data.found?.toLocaleString()} jobs (showing ${jobs.length}):\n\n${jobs.map((j: any, i: number) =>
           `${i + 1}. **${j.title}** at ${j.company}\n   ${j.location} | ${j.remote} | ${j.salary}\n   Skills: ${j.skills}\n   Apply: ${j.apply_url}\n   ID: ${j.job_handle}`
         ).join('\n\n')}`;
       }
-
-      text += mcpWarning(result.mcpRemaining);
 
       return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
@@ -151,7 +161,8 @@ server.tool(
       const job = result.data;
       const salary = formatSalary(job.salary_min, job.salary_max);
 
-      let text = `**${job.title}** at ${job.company?.name || job.company_name || 'Unknown'}\n\n` +
+      let text = mcpWarning(result.mcpRemaining);
+      text += `**${job.title}** at ${job.company?.name || job.company_name || 'Unknown'}\n\n` +
         `Location: ${job.locations?.join(', ') || 'Not specified'}\n` +
         `Salary: ${salary}\n` +
         `Seniority: ${job.seniority?.join(', ') || 'Not specified'}\n` +
@@ -159,8 +170,6 @@ server.tool(
         `Type: ${job.employment_type || 'Not specified'}\n` +
         `Apply: ${job.url || 'Not available'}\n\n` +
         `---\n\n${job.description || 'No description available.'}`;
-
-      text += mcpWarning(result.mcpRemaining);
 
       return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
@@ -181,14 +190,13 @@ server.tool(
       const result = await client.getCompany(args.company);
       const company = result.data;
       const companyName = company.name || company.profile_name || company.handle || 'Unknown';
-      let text = `**${companyName}** (${company.domain || company.domain_name})\n\n` +
+      let text = mcpWarning(result.mcpRemaining);
+      text += `**${companyName}** (${company.domain || company.domain_name})\n\n` +
         `Industry: ${company.industry?.join(', ') || 'Not specified'}\n` +
         `Size: ${company.employee_count || 'Not specified'}\n` +
         `Funding: ${company.funding || 'Not specified'}\n` +
         `Career page: ${company.career_url || 'Not available'}\n` +
         `Open jobs: ${company.job_count || 'Unknown'}`;
-
-      text += mcpWarning(result.mcpRemaining);
 
       return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
@@ -221,11 +229,10 @@ server.tool(
         job_handle: j.job_handle || '',
       }));
 
-      let text = `Found ${jobs.length} similar jobs:\n\n${jobs.map((j: any, i: number) =>
+      let text = mcpWarning(result.mcpRemaining);
+      text += `Found ${jobs.length} similar jobs:\n\n${jobs.map((j: any, i: number) =>
         `${i + 1}. **${j.title}** at ${j.company} — ${j.salary} ${j.score}`
       ).join('\n')}`;
-
-      text += mcpWarning(result.mcpRemaining);
 
       return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
@@ -248,14 +255,14 @@ server.tool(
     try {
       const result = await client.searchJobs({ q: '*', per_page: '0', facets: args.facets ?? 'seniority,job_function,remote_type,employment_type,required_skills' });
       const facets = result.data.facets || {};
-      let text = 'Available filter values:\n';
+      let text = mcpWarning(result.mcpRemaining);
+      text += 'Available filter values:\n';
       for (const [field, values] of Object.entries(facets)) {
         text += `\n**${field}:**\n`;
         for (const v of values as any[]) {
           text += `  - ${v.value} (${v.count.toLocaleString()} jobs)\n`;
         }
       }
-      text += mcpWarning(result.mcpRemaining);
       return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
       return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
