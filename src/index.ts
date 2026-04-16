@@ -32,8 +32,8 @@ function formatSalary(min: number | undefined, max: number | undefined): string 
 function mcpWarning(remaining?: number): string {
   if (!isFreeMode || remaining === undefined) return '';
   if (remaining <= 0) return '\n\n⚠️ Daily free limit reached. Get unlimited access with your own API key at jobdatalake.com';
-  if (remaining <= 50) return `\n\n⚠️ ${remaining} free requests remaining today. Get unlimited access at jobdatalake.com`;
-  return '';
+  if (remaining <= 50) return `\n\n⚠️ ${remaining}/500 free calls remaining today. Get unlimited access at jobdatalake.com`;
+  return `\n\n📊 ${remaining}/500 free calls remaining today`;
 }
 
 const server = new McpServer({
