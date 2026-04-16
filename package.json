@@ -1,0 +1,36 @@
+{
+  "name": "@jobdatalake/mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for JobDataLake — search 1M+ enriched job listings from AI tools",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "jdl-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "job-data",
+    "job-search",
+    "ai",
+    "claude",
+    "cursor"
+  ],
+  "author": "JobDataLake",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
