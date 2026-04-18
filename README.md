@@ -108,6 +108,10 @@ Credits never expire. [Get your API key](https://www.jobdatalake.com).
 | "Highest paying remote jobs" | Salary sort |
 | "What skills are most in demand?" | Filter options tool |
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Support
 
 - Questions: mg@jobdatalake.com
