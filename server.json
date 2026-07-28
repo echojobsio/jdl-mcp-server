@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.echojobsio/jdl-mcp-server",
+  "description": "Search 1M+ enriched job listings from 20,000+ companies across 40+ ATS platforms. Filter by skills, salary, location, seniority, and remote type. Free — 500 calls/day, no signup.",
+  "title": "JobDataLake",
+  "websiteUrl": "https://www.jobdatalake.com",
+  "repository": {
+    "url": "https://github.com/echojobsio/jdl-mcp-server",
+    "source": "github"
+  },
+  "version": "1.0.14",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@jobdatalake/mcp-server",
+      "version": "1.0.14",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "JDL_API_KEY",
+          "description": "Optional JobDataLake API key for unlimited access. Without it, 500 free calls/day are included. Get one at https://www.jobdatalake.com/register",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "sse",
+      "url": "https://mcp.jobdatalake.com/sse"
+    }
+  ]
+}
