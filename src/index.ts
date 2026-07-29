@@ -72,6 +72,9 @@ server.tool(
     page: z.number().optional().default(1),
     per_page: z.number().optional().default(20).describe('Results per page (max 100)'),
   },
+  // Read-only, fetches live external data. Required by MCP hosts' review
+  // (e.g. the ChatGPT app directory) and clarifies safety for every client.
+  { readOnlyHint: true, openWorldHint: true },
   async (args) => {
     const params: Record<string, string> = {};
     if (args.query) params.q = args.query;
@@ -155,6 +158,7 @@ server.tool(
   {
     job_id: z.string().describe('Job handle from search results (e.g. "dropbox-senior-full-stack-software-engineer-d3f1k")'),
   },
+  { readOnlyHint: true, openWorldHint: true },
   async (args) => {
     try {
       const result = await client.getJob(args.job_id);
@@ -185,6 +189,7 @@ server.tool(
   {
     company: z.string().describe('Company domain (e.g. "stripe.com") or handle'),
   },
+  { readOnlyHint: true, openWorldHint: true },
   async (args) => {
     try {
       const result = await client.getCompany(args.company);
@@ -213,6 +218,7 @@ server.tool(
     job_id: z.string().describe('Job handle or ID to find similar jobs for'),
     per_page: z.number().optional().default(10).describe('Number of results'),
   },
+  { readOnlyHint: true, openWorldHint: true },
   async (args) => {
     try {
       const params: Record<string, string> = {
@@ -251,6 +257,7 @@ server.tool(
   {
     facets: z.string().optional().default('seniority,job_function,remote_type,employment_type,required_skills').describe('Comma-separated facet fields to retrieve'),
   },
+  { readOnlyHint: true, openWorldHint: true },
   async (args) => {
     try {
       const result = await client.searchJobs({ q: '*', per_page: '0', facets: args.facets ?? 'seniority,job_function,remote_type,employment_type,required_skills' });
