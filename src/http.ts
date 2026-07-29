@@ -14,6 +14,7 @@
 import express, { type Request, type Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createServer } from './server.js';
 
@@ -71,6 +72,33 @@ const handleSession = async (req: Request, res: Response) => {
 };
 app.get('/mcp', handleSession);
 app.delete('/mcp', handleSession);
+
+// --- Legacy SSE transport (backward compatibility) -------------------------
+// The Claude connector directory and existing remote clients connect over SSE
+// at /sse. Keep it alongside Streamable HTTP so upgrading the server does not
+// break them: GET /sse opens the stream; the client POSTs messages to /messages
+// (the path is advertised to the client when the stream opens).
+const sseTransports: Record<string, SSEServerTransport> = {};
+
+app.get('/sse', async (_req: Request, res: Response) => {
+  const transport = new SSEServerTransport('/messages', res);
+  sseTransports[transport.sessionId] = transport;
+  res.on('close', () => {
+    delete sseTransports[transport.sessionId];
+  });
+  const server = createServer();
+  await server.connect(transport);
+});
+
+app.post('/messages', async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string | undefined;
+  const transport = sessionId ? sseTransports[sessionId] : undefined;
+  if (!transport) {
+    res.status(400).send('No active SSE session for the given sessionId');
+    return;
+  }
+  await transport.handlePostMessage(req, res, req.body);
+});
 
 const port = parseInt(process.env.PORT || '8080', 10);
 app.listen(port, () => {
