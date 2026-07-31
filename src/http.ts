@@ -29,7 +29,12 @@ app.get('/health', (_req: Request, res: Response) => {
 // Live sessions: session id -> transport.
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-app.post('/mcp', async (req: Request, res: Response) => {
+// Serve the Streamable HTTP endpoint at BOTH the root path and /mcp. The
+// existing Claude connector (and the Claude directory listing) connect at the
+// ROOT of mcp.jobdatalake.com; ChatGPT/newer clients use /mcp. Serving both
+// keeps every client working. (Regression fix: an earlier version only served
+// /mcp, so root returned 404 and Claude could not connect.)
+app.post(['/', '/mcp'], async (req: Request, res: Response) => {
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
   let transport: StreamableHTTPServerTransport;
 
@@ -70,8 +75,8 @@ const handleSession = async (req: Request, res: Response) => {
   }
   await transports[sessionId].handleRequest(req, res);
 };
-app.get('/mcp', handleSession);
-app.delete('/mcp', handleSession);
+app.get(['/', '/mcp'], handleSession);
+app.delete(['/', '/mcp'], handleSession);
 
 // --- Legacy SSE transport (backward compatibility) -------------------------
 // The Claude connector directory and existing remote clients connect over SSE
