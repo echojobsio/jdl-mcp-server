@@ -214,18 +214,46 @@ server.tool(
 );
 
 // --- find_similar_jobs ---
+// The API's `similar_to` parameter only accepts a job's raw id, but every other
+// tool in this server speaks in job handles (search_jobs surfaces `job_handle`,
+// never the id). Passing a handle straight through always fails with an
+// "embedding" error, which reads like the job has no vector when it really
+// means the identifier was wrong. Resolve the handle to an id first.
+const RAW_JOB_ID = /^[a-f0-9]{24}$/i;
+
 server.tool(
   'find_similar_jobs',
   'Find jobs similar to a given job listing using AI vector similarity. Great for "more like this" discovery.',
   {
-    job_id: z.string().describe('Job handle or ID to find similar jobs for'),
+    job_id: z.string().describe('Job handle from search results (e.g. "dropbox-senior-full-stack-software-engineer-d3f1k")'),
     per_page: z.number().optional().default(10).describe('Number of results'),
   },
   { readOnlyHint: true, openWorldHint: true },
   async (args) => {
+    let similarTo = args.job_id;
+
+    if (!RAW_JOB_ID.test(args.job_id)) {
+      try {
+        const lookup = await client.getJob(args.job_id);
+        const id = lookup.data?.id;
+        if (!id) {
+          return {
+            content: [{ type: 'text' as const, text: `No job found for handle "${args.job_id}". Use the job handle exactly as returned by search_jobs.` }],
+            isError: true,
+          };
+        }
+        similarTo = id;
+      } catch (e: any) {
+        return {
+          content: [{ type: 'text' as const, text: `Could not look up job "${args.job_id}": ${e.message}` }],
+          isError: true,
+        };
+      }
+    }
+
     try {
       const params: Record<string, string> = {
-        similar_to: args.job_id,
+        similar_to: similarTo,
         per_page: String(Math.min(args.per_page ?? 10, 50)),
       };
       const result = await client.searchJobs(params);
@@ -240,11 +268,13 @@ server.tool(
 
       let text = mcpWarning(result.mcpRemaining);
       text += `Found ${jobs.length} similar jobs:\n\n${jobs.map((j: any, i: number) =>
-        `${i + 1}. **${j.title}** at ${j.company} — ${j.salary} ${j.score}`
+        `${i + 1}. **${j.title}** at ${j.company} — ${j.salary} ${j.score}\n   ID: ${j.job_handle}`
       ).join('\n')}`;
 
       return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
+      // The id is known-good at this point, so an embedding error really does mean
+      // this job has no vector — coverage is limited to remote and tech listings.
       if (e.message?.includes('embedding')) {
         return { content: [{ type: 'text' as const, text: 'This job doesn\'t have vector embeddings yet. Similar job search is only available for remote and tech jobs. Try using search_jobs with similar keywords instead.' }] };
       }
@@ -252,6 +282,7 @@ server.tool(
     }
   }
 );
+
 
 // --- get_filter_options ---
 server.tool(

@@ -134,3 +134,64 @@ test('search_jobs returns data (live JDL API — soft)', async (t) => {
     t.diagnostic(`live API check skipped (network/env): ${err.message}`);
   }
 });
+
+// Regression: find_similar_jobs must accept a job HANDLE, not just a raw id.
+//
+// The JDL API's `similar_to` parameter only accepts a job's raw id, but every
+// tool here surfaces `job_handle` and never the id — so a model calling this
+// tool can only ever pass a handle. Passing the handle straight through made
+// the API return an "embedding" error, which the catch block rewrote into
+// "this job doesn't have vector embeddings yet". That message is plausible and
+// matches a real documented limitation, so the tool looked like it was working
+// (isError: false) while being 100% broken for every caller.
+//
+// Rather than hardcode a handle (job data rolls hourly), discover candidates
+// via search_jobs and assert that at least one of them returns real results
+// when addressed BY HANDLE. If handle->id resolution regresses, every
+// candidate falls back to the embeddings message and this fails.
+test('find_similar_jobs works when given a job handle (live JDL API — soft)', async (t) => {
+  const NO_EMBEDDINGS = /doesn't have vector embeddings/;
+  let handles;
+  let searchText = '';
+  try {
+    const { sid } = await rpc('/', INIT);
+    await rpc('/', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
+    const search = await rpc('/', {
+      jsonrpc: '2.0', id: 4, method: 'tools/call',
+      params: { name: 'search_jobs', arguments: { query: 'software engineer', remote_type: 'fully_remote', per_page: 5 } },
+    }, sid);
+    searchText = search.json?.result?.content?.[0]?.text ?? '';
+    handles = [...searchText.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
+  } catch (err) {
+    t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+    return;
+  }
+
+  // Not a skip: search_jobs is already proven working by the test above, so if we
+  // got a response and still can't pull handles out of it, the output format
+  // changed or the arguments were rejected — both are regressions worth failing on.
+  assert.ok(handles.length, `expected job handles from search_jobs, got:\n${searchText.slice(0, 400)}`);
+
+  const seen = [];
+  for (const handle of handles) {
+    const { sid } = await rpc('/', INIT);
+    await rpc('/', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
+    const r = await rpc('/', {
+      jsonrpc: '2.0', id: 5, method: 'tools/call',
+      params: { name: 'find_similar_jobs', arguments: { job_id: handle, per_page: 3 } },
+    }, sid);
+    const out = r.json?.result?.content?.[0]?.text ?? '';
+    assert.ok(!r.json?.result?.isError, `find_similar_jobs errored for handle ${handle}: ${out}`);
+    if (/Found \d+ similar jobs/.test(out)) return; // handle path works
+    seen.push(`${handle} -> ${out.slice(0, 80)}`);
+  }
+
+  // Every candidate claimed "no embeddings". Coverage is limited to remote/tech
+  // jobs, but these ARE remote engineering roles — so this is the handle bug.
+  assert.fail(
+    `find_similar_jobs returned no results for any of ${handles.length} remote engineering handles.\n` +
+    (seen.every((s) => NO_EMBEDDINGS.test(s))
+      ? 'All returned the "no embeddings" message — handle->id resolution is likely broken again.\n'
+      : '') + seen.join('\n')
+  );
+});
