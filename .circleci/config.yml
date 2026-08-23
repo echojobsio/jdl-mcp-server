@@ -1,0 +1,91 @@
+# CI + auto-deploy for the hosted MCP server (mcp.jobdatalake.com).
+#
+# Mirrors echojobsio/jobdatalake: `build` runs on every branch so it can gate a
+# pull request, and `deploy_to_production` is main-only and requires build, so
+# nothing ships unless the suite passes.
+#
+# Deploys were manual `gcloud run deploy --source .` before this file existed,
+# which is how the Claude root-path regression (PR #5) and the find_similar_jobs
+# handle bug (PR #7) both sat merged-but-unshipped.
+version: 2.1
+
+orbs:
+  gcp-gcr: circleci/gcp-gcr@0.16.2
+  cloudrun: circleci/gcp-cloud-run@1.0.2
+
+jobs:
+  build:
+    docker:
+      - image: cimg/node:20.19
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - npm-{{ checksum "package-lock.json" }}
+      - run:
+          name: Install dependencies
+          command: npm ci
+      - save_cache:
+          key: npm-{{ checksum "package-lock.json" }}
+          paths:
+            - ~/.npm
+      - run:
+          # `npm test` builds first, then runs the integration suite against the
+          # built server: MCP served at the root path (Claude), /mcp (ChatGPT),
+          # legacy /sse, all five tools, and find_similar_jobs by job handle.
+          # The live-API checks go soft on network failure so a JDL blip cannot
+          # redden an unrelated build.
+          name: Build and run integration tests
+          command: npm test
+
+  deploy_to_production:
+    docker:
+      - image: cimg/node:20.19
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Build Docker image
+          command: |
+            export CLOUDSDK_PYTHON=/usr/bin/python3
+            echo 'export PATH=~$PATH:~/.local/bin' >> $BASH_ENV
+            echo ${GCP_PROJECT_KEY} | base64 --decode --ignore-garbage > $HOME/gcloud-service-key.json
+            echo 'export GOOGLE_CLOUD_KEYS=$(cat $HOME/gcloud-service-key.json)' >> $BASH_ENV
+            echo 'export TAG=${CIRCLE_SHA1}' >> $BASH_ENV
+            echo 'export IMAGE_NAME=$CIRCLE_PROJECT_REPONAME' >> $BASH_ENV && source $BASH_ENV
+            docker build -t us.gcr.io/$GOOGLE_PROJECT_ID/$IMAGE_NAME -t us.gcr.io/$GOOGLE_PROJECT_ID/$IMAGE_NAME:$TAG .
+      - gcp-gcr/gcr-auth:
+          gcloud-service-key: GOOGLE_CLOUD_KEYS
+          google-project-id: GOOGLE_PROJECT_ID
+          google-compute-zone: GOOGLE_COMPUTE_ZONE
+      - gcp-gcr/push-image:
+          google-project-id: GOOGLE_PROJECT_ID
+          registry-url: "us.gcr.io"
+          image: $IMAGE_NAME
+      - cloudrun/deploy:
+          platform: "managed"
+          image: "us.gcr.io/$GOOGLE_PROJECT_ID/$IMAGE_NAME:$CIRCLE_SHA1"
+          service-name: "jdl-mcp-server"
+          # Hardcoded, not $GOOGLE_COMPUTE_REGION: the service already exists in
+          # us-central1 and is fronted by mcp.jobdatalake.com. Deploying to any
+          # other region would silently create a SECOND service instead of a new
+          # revision, leaving the live domain on stale code.
+          region: "us-central1"
+          # Public MCP endpoint — Claude and ChatGPT connect unauthenticated.
+          unauthenticated: true
+
+workflows:
+  mcp-server:
+    jobs:
+      # Every branch, so this can gate a PR.
+      - build
+
+      - deploy_to_production:
+          context:
+            - production
+          requires:
+            - build
+          filters:
+            branches:
+              only: main
