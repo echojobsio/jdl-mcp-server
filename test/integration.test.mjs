@@ -124,17 +124,26 @@ test('tools/list returns all five tools (over the root path)', async () => {
 // instead of failing CI — the endpoint/handshake/tool guards above are the hard
 // gates; this just confirms the wiring end-to-end when the network is available.
 test('search_jobs returns data (live JDL API — soft)', async (t) => {
+  let r;
   try {
     const { sid } = await rpc('/', INIT);
     await rpc('/', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
-    const r = await rpc('/', {
+    r = await rpc('/', {
       jsonrpc: '2.0', id: 3, method: 'tools/call',
       params: { name: 'search_jobs', arguments: { query: 'python', per_page: 1 } },
     }, sid);
-    assert.ok(r.json?.result?.content?.length, 'expected content from search_jobs');
   } catch (err) {
-    t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+    skipEnv(t, err);
+    return;
   }
+  // This used to assert only `content.length`. An ERROR result also has exactly
+  // one content item ("Error: Daily free limit reached…"), so it passed while
+  // the tool was failing -- quota error, API down, 500, wrong key, anything.
+  const text = r.json?.result?.content?.[0]?.text ?? '';
+  if (skipIfQuotaText(t, text)) return;
+  assert.ok(!r.json?.result?.isError, `search_jobs errored: ${text.slice(0, 200)}`);
+  assert.match(stripBanner(text), /^Found [\d,]+ jobs|^No jobs found/,
+    `search_jobs did not return a result set:\n${text.slice(0, 200)}`);
 });
 
 // Regression: find_similar_jobs must accept a job HANDLE, not just a raw id.
@@ -165,16 +174,13 @@ test('find_similar_jobs works when given a job handle (live JDL API — soft)', 
     searchText = search.json?.result?.content?.[0]?.text ?? '';
     handles = [...searchText.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
   } catch (err) {
-    t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+    skipEnv(t, err);
     return;
   }
 
   // Quota exhaustion is environmental, not a regression — skip rather than
   // redden `build` and block the CircleCI deploy job.
-  if (QUOTA_EXHAUSTED.test(searchText)) {
-    t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
-    return;
-  }
+  if (skipIfQuotaText(t, searchText)) return;
 
   // Not a skip: search_jobs is already proven working by the test above, so if we
   // got a response and still can't pull handles out of it, the output format
@@ -190,8 +196,15 @@ test('find_similar_jobs works when given a job handle (live JDL API — soft)', 
       params: { name: 'find_similar_jobs', arguments: { job_id: handle, per_page: 3 } },
     }, sid);
     const out = r.json?.result?.content?.[0]?.text ?? '';
+    // Re-check per iteration: the seed check happens once, but this loop makes
+    // ~2 more billed calls per handle. If the 500th lands mid-loop the error
+    // text is "Daily free limit reached", the assert fails, `build` goes red
+    // and the deploy is blocked by quota -- inverting the whole design.
+    if (skipIfQuotaText(t, out)) return;
     assert.ok(!r.json?.result?.isError, `find_similar_jobs errored for handle ${handle}: ${out}`);
-    if (/Found \d+ similar jobs/.test(out)) return; // handle path works
+    // `Found 0 similar jobs` matches /Found \d+/ and would declare victory on an
+    // empty result set -- a backend returning nothing for every job would pass.
+    if (/Found [1-9]\d* similar jobs/.test(out)) return; // handle path works
     seen.push(`${handle} -> ${out.slice(0, 80)}`);
   }
 
@@ -237,13 +250,10 @@ test('find_similar_jobs excludes the query job from its own results',
       seedText = search.json?.result?.content?.[0]?.text ?? '';
       handles = [...seedText.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
     } catch (err) {
-      t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+      skipEnv(t, err);
       return;
     }
-    if (QUOTA_EXHAUSTED.test(seedText)) {
-      t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
-      return;
-    }
+    if (skipIfQuotaText(t, seedText)) return;
     assert.ok(handles.length, 'expected job handles from search_jobs');
 
     const offenders = [];
@@ -256,7 +266,11 @@ test('find_similar_jobs excludes the query job from its own results',
         params: { name: 'find_similar_jobs', arguments: { job_id: handle, per_page: 5 } },
       }, sid);
       const out = r.json?.result?.content?.[0]?.text ?? '';
-      if (!/Found \d+ similar jobs/.test(out)) continue; // no embeddings for this job
+      if (skipIfQuotaText(t, out)) return;
+      // Require a NON-ZERO count: "Found 0 similar jobs" has no ID: lines, so it
+      // would contribute no offenders and silently inflate `checked`, letting
+      // this test judge self-exclusion on zero actual results.
+      if (!/Found [1-9]\d* similar jobs/.test(out)) continue; // no embeddings / empty
       checked++;
       const returned = [...out.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
       const idx = returned.indexOf(handle);
@@ -290,19 +304,37 @@ async function session() {
 // that exhausts the quota must SKIP, not fail: a red `build` blocks the
 // CircleCI deploy job, and "we ran out of API calls" is not a code regression.
 // Set JDL_API_KEY in the CircleCI project to remove the ceiling entirely.
+// Uses t.skip(), NOT t.diagnostic() + return. `return` counts the test as a
+// PASS: a run where every live assertion bailed reported "pass 32, skipped 0",
+// indistinguishable from one where they all genuinely asserted -- and
+// deploy_to_production proceeds on that. t.skip() reports it as skipped.
 function skipIfQuotaExhausted(t, r) {
-  if (QUOTA_EXHAUSTED.test(r.text) || QUOTA_EXHAUSTED.test(r.raw ?? '')) {
-    t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
+  if (QUOTA_EXHAUSTED.test(r.text ?? '') || QUOTA_EXHAUSTED.test(r.raw ?? '')) {
+    t.skip('JDL free-tier quota exhausted for this IP');
     return true;
   }
   return false;
+}
+
+// Same, for a bare response string (seed searches).
+function skipIfQuotaText(t, text) {
+  if (QUOTA_EXHAUSTED.test(text ?? '')) {
+    t.skip('JDL free-tier quota exhausted for this IP');
+    return true;
+  }
+  return false;
+}
+
+// A live call failed for an environmental reason (network/DNS/server down).
+function skipEnv(t, err) {
+  t.skip(`live API unavailable: ${err.message}`);
 }
 
 // Strips the free-tier quota banner so assertions match on content, not quota.
 // Deliberately anchored to the banner's own wording rather than "everything up
 // to the first newline": an earlier version of this helper swallowed the first
 // line of real output too, because the banner used to run into the content.
-const BANNER = /^\s*[📊⚠️][^\n]*(free calls remaining today|Daily free limit reached)[^\n]*\n*/;
+const BANNER = /^\s*[\u{1F4CA}\u{26A0}\uFE0F]+[^\n]*(free calls remaining today|Daily free limit reached)[^\n]*\n*/u;
 function stripBanner(text) {
   return text.replace(BANNER, '').trim();
 }
@@ -372,13 +404,10 @@ test('get_job returns the requested job, addressed by handle (live — soft)', a
     handleSearchText = s.text;
     handle = (s.text.match(/^\s*ID:\s*(\S+)$/m) ?? [])[1];
   } catch (err) {
-    t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+    skipEnv(t, err);
     return;
   }
-  if (QUOTA_EXHAUSTED.test(handleSearchText)) {
-    t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
-    return;
-  }
+  if (skipIfQuotaText(t, handleSearchText)) return;
   assert.ok(handle, 'search_jobs returned no handle to look up');
 
   const r = await callTool(sid, 'get_job', { job_id: handle });
@@ -402,10 +431,15 @@ test('get_job returns the requested job, addressed by handle (live — soft)', a
 test('get_job rejects an unknown handle with a real error (live — soft)', async (t) => {
   let sid;
   try { sid = await session(); } catch (err) {
-    t.diagnostic(`skipped: ${err.message}`); return;
+    skipEnv(t, err); return;
   }
   const r = await callTool(sid, 'get_job', { job_id: 'definitely-not-a-real-job-handle-zzzz' });
+  if (skipIfQuotaExhausted(t, r)) return;
   assert.ok(r.isError, `expected isError for an unknown handle, got:\n${r.text.slice(0, 200)}`);
+  // Assert WHY it errored. Without this the test passed while the API was
+  // returning 429 for everything -- it proved nothing about not-found handling.
+  assert.match(r.text, /not found|404/i,
+    `expected a not-found error, got a different failure:\n${r.text.slice(0, 200)}`);
 });
 
 // --- get_company --------------------------------------------------------
@@ -413,7 +447,7 @@ test('get_job rejects an unknown handle with a real error (live — soft)', asyn
 test('get_company returns the requested company (live — soft)', async (t) => {
   let sid;
   try { sid = await session(); } catch (err) {
-    t.diagnostic(`skipped: ${err.message}`); return;
+    skipEnv(t, err); return;
   }
   const r = await callTool(sid, 'get_company', { company: 'stripe.com' });
   if (skipIfQuotaExhausted(t, r)) return;
@@ -428,10 +462,13 @@ test('get_company returns the requested company (live — soft)', async (t) => {
 test('get_company rejects an unknown domain with a real error (live — soft)', async (t) => {
   let sid;
   try { sid = await session(); } catch (err) {
-    t.diagnostic(`skipped: ${err.message}`); return;
+    skipEnv(t, err); return;
   }
   const r = await callTool(sid, 'get_company', { company: 'not-a-real-company-zzzz.invalid' });
+  if (skipIfQuotaExhausted(t, r)) return;
   assert.ok(r.isError, `expected isError for an unknown domain, got:\n${r.text.slice(0, 200)}`);
+  assert.match(r.text, /not found|404/i,
+    `expected a not-found error, got a different failure:\n${r.text.slice(0, 200)}`);
 });
 
 // --- get_filter_options -------------------------------------------------
@@ -439,7 +476,7 @@ test('get_company rejects an unknown domain with a real error (live — soft)', 
 test('get_filter_options returns facets with counts (live — soft)', async (t) => {
   let sid;
   try { sid = await session(); } catch (err) {
-    t.diagnostic(`skipped: ${err.message}`); return;
+    skipEnv(t, err); return;
   }
   const r = await callTool(sid, 'get_filter_options', {});
   if (skipIfQuotaExhausted(t, r)) return;
@@ -456,7 +493,7 @@ test('get_filter_options returns facets with counts (live — soft)', async (t) 
 test('get_filter_options honours an explicit facet list (live — soft)', async (t) => {
   let sid;
   try { sid = await session(); } catch (err) {
-    t.diagnostic(`skipped: ${err.message}`); return;
+    skipEnv(t, err); return;
   }
   const r = await callTool(sid, 'get_filter_options', { facets: 'remote_type' });
   if (skipIfQuotaExhausted(t, r)) return;
@@ -470,7 +507,7 @@ test('get_filter_options honours an explicit facet list (live — soft)', async 
 test('search_jobs honours per_page (live — soft)', async (t) => {
   let sid;
   try { sid = await session(); } catch (err) {
-    t.diagnostic(`skipped: ${err.message}`); return;
+    skipEnv(t, err); return;
   }
   const r = await callTool(sid, 'search_jobs', { query: 'engineer', per_page: 3 });
   if (skipIfQuotaExhausted(t, r)) return;
@@ -485,7 +522,7 @@ test('search_jobs honours per_page (live — soft)', async (t) => {
 test('search_jobs explains itself when filters match nothing (live — soft)', async (t) => {
   let sid;
   try { sid = await session(); } catch (err) {
-    t.diagnostic(`skipped: ${err.message}`); return;
+    skipEnv(t, err); return;
   }
   const r = await callTool(sid, 'search_jobs', {
     query: 'zzzqqxunlikelykeyword', salary_min: 990, per_page: 5,
@@ -518,26 +555,26 @@ test('handles from search_jobs are accepted by get_job and find_similar_jobs (li
     chainSearchText = s.text;
     handles = [...s.text.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
   } catch (err) {
-    t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+    skipEnv(t, err);
     return;
   }
-  if (QUOTA_EXHAUSTED.test(chainSearchText)) {
-    t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
-    return;
-  }
+  if (skipIfQuotaText(t, chainSearchText)) return;
   assert.ok(handles.length, 'search_jobs returned no handles');
 
   const handle = handles[0];
   const job = await callTool(sid, 'get_job', { job_id: handle });
+  if (skipIfQuotaExhausted(t, job)) return;
   assert.ok(!job.isError, `get_job rejected a handle from search_jobs: ${job.text}`);
 
   const similar = await callTool(sid, 'find_similar_jobs', { job_id: handle, per_page: 3 });
+  if (skipIfQuotaExhausted(t, similar)) return;
   assert.ok(!similar.isError, `find_similar_jobs rejected a handle from search_jobs: ${similar.text}`);
 
   // Handles returned by find_similar_jobs must round-trip too.
   const nested = [...similar.text.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
   if (nested.length) {
     const back = await callTool(sid, 'get_job', { job_id: nested[0] });
+    if (skipIfQuotaExhausted(t, back)) return;
     assert.ok(!back.isError, `a handle from find_similar_jobs was rejected by get_job: ${back.text}`);
   }
 });
@@ -549,13 +586,13 @@ test('handles from search_jobs are accepted by get_job and find_similar_jobs (li
 test('the free-tier banner is separated from the response body (live — soft)', async (t) => {
   let sid;
   try { sid = await session(); } catch (err) {
-    t.diagnostic(`skipped: ${err.message}`); return;
+    skipEnv(t, err); return;
   }
   const r = await callTool(sid, 'search_jobs', { query: 'engineer', per_page: 1 });
   if (skipIfQuotaExhausted(t, r)) return;
   assert.ok(!r.isError, `search_jobs errored: ${r.text}`);
   if (!/free calls remaining|Daily free limit/.test(r.raw)) {
-    t.diagnostic('not in free mode — banner assertion not applicable');
+    t.skip('not in free mode — no banner to separate');
     return;
   }
   assert.match(r.raw, /(remaining today|jobdatalake\.com)\s*\n/,

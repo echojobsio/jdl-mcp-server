@@ -78,8 +78,13 @@ server.tool(
     page: z.number().optional().default(1),
     per_page: z.number().optional().default(20).describe('Results per page (max 100)'),
   },
-  // Read-only, fetches live external data. Required by MCP hosts' review
-  // (e.g. the ChatGPT app directory) and clarifies safety for every client.
+  // Read-only; queries the JobDataLake API only. All three hints are set
+  // explicitly because MCP hosts' review (e.g. the ChatGPT app directory) reads
+  // them, and chatgpt-app-submission.json must state the same values.
+  // openWorldHint is false: the domain of interaction is one first-party API
+  // over a fixed corpus, and no tool here can modify public or third-party
+  // state. (The previous comment said "fetches live external data" directly
+  // above openWorldHint: false, which read as a contradiction.)
   { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     const params: Record<string, string> = {};
@@ -222,7 +227,13 @@ server.tool(
 // never the id). Passing a handle straight through always fails with an
 // "embedding" error, which reads like the job has no vector when it really
 // means the identifier was wrong. Resolve the handle to an id first.
-const RAW_JOB_ID = /^[a-f0-9]{24}$/i;
+// Lowercase only, deliberately. The /i variant accepted uppercase hex, which
+// skipped the handle->id lookup and went straight to `similar_to` -- but the
+// backing store matches ids case-sensitively, so it never resolved and the
+// caller got the "no embeddings yet" message instead of a real error. Anything
+// that is not exactly a lowercase 24-hex id now goes through the lookup, which
+// fails honestly with a 404.
+const RAW_JOB_ID = /^[a-f0-9]{24}$/;
 
 server.tool(
   'find_similar_jobs',
@@ -276,9 +287,12 @@ server.tool(
 
       return { content: [{ type: 'text' as const, text }] };
     } catch (e: any) {
-      // The id is known-good at this point, so an embedding error really does mean
-      // this job has no vector — coverage is limited to remote and tech listings.
-      if (e.message?.includes('embedding')) {
+      // Only claim "no embeddings" when we RESOLVED the id ourselves. For a
+      // caller-supplied raw id we never verified it exists, so rewriting the
+      // API's error would hand back a confident, wrong explanation -- exactly
+      // the failure that hid the handle bug for weeks.
+      const resolvedByUs = similarTo !== args.job_id;
+      if (resolvedByUs && e.message?.includes('embedding')) {
         return { content: [{ type: 'text' as const, text: 'This job doesn\'t have vector embeddings yet. Similar job search is only available for remote and tech jobs. Try using search_jobs with similar keywords instead.' }] };
       }
       return { content: [{ type: 'text' as const, text: `Error: ${e.message}` }], isError: true };
