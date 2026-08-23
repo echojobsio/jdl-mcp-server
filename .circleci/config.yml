@@ -63,6 +63,11 @@ jobs:
           google-project-id: GOOGLE_PROJECT_ID
           registry-url: "us.gcr.io"
           image: $IMAGE_NAME
+          # Must include $CIRCLE_SHA1: the deploy step below pins the image to
+          # that tag, and push-image defaults to `latest` only -- so the first
+          # main pipeline pushed :latest, then failed with "Image ...:<sha> not
+          # found". The orb evaluates each comma-separated tag at run time.
+          tag: "latest,$CIRCLE_SHA1"
       - cloudrun/deploy:
           platform: "managed"
           image: "us.gcr.io/$GOOGLE_PROJECT_ID/$IMAGE_NAME:$CIRCLE_SHA1"
