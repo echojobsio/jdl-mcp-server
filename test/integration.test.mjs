@@ -195,3 +195,61 @@ test('find_similar_jobs works when given a job handle (live JDL API — soft)', 
       : '') + seen.join('\n')
   );
 });
+
+// The query job must not appear in its own "more like this" results.
+//
+// `similar_to` runs an ANN search using the job's own stored embedding, and a
+// vector's nearest neighbour is always itself -- so the query job comes back as
+// its own #1 hit at score ~1.0 unless the backend excludes it. Measured against
+// production: 8/8 sampled jobs returned themselves at rank 1. Every caller
+// silently loses one of N results to the job they are already viewing (20% of
+// the payload at per_page=5).
+//
+// The test above passes happily while this is broken -- it only asserts that
+// SOME results came back, not that they are useful -- which is exactly how this
+// survived a fix, a deploy, and a green suite.
+//
+// Fixed in the API by echojobsio/jobdatalake#67 (excludeJob drops the query job
+// after the Typesense call). The first attempt, #66, tried to do it as a
+// Typesense filter -- `id:!=<id>` -- which Typesense rejects outright and which
+// 500'd the entire similar_to path in production until it was rolled forward.
+// This test is the end-to-end guard neither of those changes had.
+test('find_similar_jobs excludes the query job from its own results',
+  async (t) => {
+    let handles = [];
+    try {
+      const { sid } = await rpc('/', INIT);
+      await rpc('/', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
+      const search = await rpc('/', {
+        jsonrpc: '2.0', id: 6, method: 'tools/call',
+        params: { name: 'search_jobs', arguments: { query: 'software engineer', remote_type: 'fully_remote', per_page: 5 } },
+      }, sid);
+      const txt = search.json?.result?.content?.[0]?.text ?? '';
+      handles = [...txt.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
+    } catch (err) {
+      t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+      return;
+    }
+    assert.ok(handles.length, 'expected job handles from search_jobs');
+
+    const offenders = [];
+    let checked = 0;
+    for (const handle of handles) {
+      const { sid } = await rpc('/', INIT);
+      await rpc('/', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
+      const r = await rpc('/', {
+        jsonrpc: '2.0', id: 7, method: 'tools/call',
+        params: { name: 'find_similar_jobs', arguments: { job_id: handle, per_page: 5 } },
+      }, sid);
+      const out = r.json?.result?.content?.[0]?.text ?? '';
+      if (!/Found \d+ similar jobs/.test(out)) continue; // no embeddings for this job
+      checked++;
+      const returned = [...out.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
+      const idx = returned.indexOf(handle);
+      if (idx >= 0) offenders.push(`${handle} -> self at index ${idx} of ${returned.length}`);
+    }
+
+    assert.ok(checked, 'no sampled job had embeddings — cannot judge self-exclusion');
+    assert.deepEqual(offenders, [],
+      `the query job was returned as its own match in ${offenders.length}/${checked} cases:\n${offenders.join('\n')}`);
+  });
