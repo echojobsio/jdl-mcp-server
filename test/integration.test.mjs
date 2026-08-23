@@ -209,16 +209,12 @@ test('find_similar_jobs works when given a job handle (live JDL API — soft)', 
 // SOME results came back, not that they are useful -- which is exactly how this
 // survived a fix, a deploy, and a green suite.
 //
-// Marked `todo` deliberately: the fix is in the API, not this repo
-// (echojobsio/jobdatalake#66), so this cannot pass until that deploys. `todo`
-// keeps the suite honest without turning `build` red, which would block the
-// CircleCI `deploy_to_production` job that requires it.
-//
-// ONCE jobdatalake#66 IS DEPLOYED: drop the `{ todo: ... }` option so this
-// becomes a hard gate. Node reports a passing todo, so a green line here with
-// the todo marker still attached means it is ready to promote.
+// Fixed in the API by echojobsio/jobdatalake#67 (excludeJob drops the query job
+// after the Typesense call). The first attempt, #66, tried to do it as a
+// Typesense filter -- `id:!=<id>` -- which Typesense rejects outright and which
+// 500'd the entire similar_to path in production until it was rolled forward.
+// This test is the end-to-end guard neither of those changes had.
 test('find_similar_jobs excludes the query job from its own results',
-  { todo: 'needs echojobsio/jobdatalake#66 deployed; remove this option once it is' },
   async (t) => {
     let handles = [];
     try {
