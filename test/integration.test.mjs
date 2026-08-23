@@ -46,6 +46,8 @@ async function rpc(path, payload, sessionId) {
   return { status: res.status, sid, json };
 }
 
+const QUOTA_EXHAUSTED = /Daily free limit reached|Rate limit exceeded/;
+
 const INIT = {
   jsonrpc: '2.0',
   id: 1,
@@ -167,6 +169,13 @@ test('find_similar_jobs works when given a job handle (live JDL API — soft)', 
     return;
   }
 
+  // Quota exhaustion is environmental, not a regression — skip rather than
+  // redden `build` and block the CircleCI deploy job.
+  if (QUOTA_EXHAUSTED.test(searchText)) {
+    t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
+    return;
+  }
+
   // Not a skip: search_jobs is already proven working by the test above, so if we
   // got a response and still can't pull handles out of it, the output format
   // changed or the arguments were rejected — both are regressions worth failing on.
@@ -217,6 +226,7 @@ test('find_similar_jobs works when given a job handle (live JDL API — soft)', 
 test('find_similar_jobs excludes the query job from its own results',
   async (t) => {
     let handles = [];
+    let seedText = '';
     try {
       const { sid } = await rpc('/', INIT);
       await rpc('/', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
@@ -224,10 +234,14 @@ test('find_similar_jobs excludes the query job from its own results',
         jsonrpc: '2.0', id: 6, method: 'tools/call',
         params: { name: 'search_jobs', arguments: { query: 'software engineer', remote_type: 'fully_remote', per_page: 5 } },
       }, sid);
-      const txt = search.json?.result?.content?.[0]?.text ?? '';
-      handles = [...txt.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
+      seedText = search.json?.result?.content?.[0]?.text ?? '';
+      handles = [...seedText.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
     } catch (err) {
       t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+      return;
+    }
+    if (QUOTA_EXHAUSTED.test(seedText)) {
+      t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
       return;
     }
     assert.ok(handles.length, 'expected job handles from search_jobs');
@@ -253,3 +267,300 @@ test('find_similar_jobs excludes the query job from its own results',
     assert.deepEqual(offenders, [],
       `the query job was returned as its own match in ${offenders.length}/${checked} cases:\n${offenders.join('\n')}`);
   });
+
+// ---------------------------------------------------------------------------
+// Tool contract
+//
+// `tools/list returns all five tools` above asserts only that the tools are
+// REGISTERED. Registration is not evidence of working: find_similar_jobs was
+// registered, listed, and 100% broken for every caller at the same time. The
+// tests below actually invoke each tool and assert on what comes back.
+// ---------------------------------------------------------------------------
+
+// Open one session and reuse it. Each call costs a free-tier API request
+// (500/day, shared), so the suite should not open a session per assertion.
+async function session() {
+  const { sid } = await rpc('/', INIT);
+  await rpc('/', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
+  return sid;
+}
+
+// The hosted server runs on the shared free key (500 calls/day, counted per
+// client IP) whenever JDL_API_KEY is unset -- which is the case in CI. A run
+// that exhausts the quota must SKIP, not fail: a red `build` blocks the
+// CircleCI deploy job, and "we ran out of API calls" is not a code regression.
+// Set JDL_API_KEY in the CircleCI project to remove the ceiling entirely.
+function skipIfQuotaExhausted(t, r) {
+  if (QUOTA_EXHAUSTED.test(r.text) || QUOTA_EXHAUSTED.test(r.raw ?? '')) {
+    t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
+    return true;
+  }
+  return false;
+}
+
+// Strips the free-tier quota banner so assertions match on content, not quota.
+// Deliberately anchored to the banner's own wording rather than "everything up
+// to the first newline": an earlier version of this helper swallowed the first
+// line of real output too, because the banner used to run into the content.
+const BANNER = /^\s*[📊⚠️][^\n]*(free calls remaining today|Daily free limit reached)[^\n]*\n*/;
+function stripBanner(text) {
+  return text.replace(BANNER, '').trim();
+}
+
+let callId = 100;
+async function callTool(sid, name, args) {
+  const r = await rpc('/', {
+    jsonrpc: '2.0', id: callId++, method: 'tools/call',
+    params: { name, arguments: args },
+  }, sid);
+  return {
+    isError: r.json?.result?.isError ?? false,
+    rpcError: r.json?.error,
+    // Strip the free-tier banner so assertions match on content, not quota.
+    raw: r.json?.result?.content?.[0]?.text ?? '',
+    text: stripBanner(r.json?.result?.content?.[0]?.text ?? ''),
+  };
+}
+
+// Every tool must carry a description, an input schema, and the three
+// annotations. The ChatGPT app directory requires all three to be set
+// explicitly and rejects submissions with missing hints, so a tool registered
+// without them is a submission blocker rather than a cosmetic gap.
+test('every tool declares a description, input schema, and annotations', async () => {
+  const sid = await session();
+  const r = await rpc('/', { jsonrpc: '2.0', id: 200, method: 'tools/list', params: {} }, sid);
+  const tools = r.json?.result?.tools ?? [];
+  assert.equal(tools.length, 5);
+  for (const t of tools) {
+    assert.ok(t.description?.length > 20, `${t.name}: description missing or too short`);
+    assert.equal(t.inputSchema?.type, 'object', `${t.name}: inputSchema is not an object schema`);
+    assert.ok(t.annotations, `${t.name}: no annotations`);
+    assert.equal(t.annotations.readOnlyHint, true, `${t.name}: readOnlyHint must be true — every tool here is read-only`);
+    for (const hint of ['openWorldHint', 'destructiveHint']) {
+      assert.equal(typeof t.annotations[hint], 'boolean', `${t.name}: ${hint} must be set explicitly`);
+    }
+  }
+});
+
+// The root path and /mcp are the same server; a divergence means one client
+// population silently gets a different tool set.
+test('/ and /mcp expose an identical tool set', async () => {
+  const names = async (path) => {
+    const { sid } = await rpc(path, INIT);
+    await rpc(path, { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
+    const r = await rpc(path, { jsonrpc: '2.0', id: 201, method: 'tools/list', params: {} }, sid);
+    return (r.json?.result?.tools ?? []).map((t) => t.name).sort();
+  };
+  assert.deepEqual(await names('/'), await names('/mcp'));
+});
+
+test('unknown tool name returns an error rather than empty success', async () => {
+  const sid = await session();
+  const r = await callTool(sid, 'no_such_tool', {});
+  assert.ok(r.isError || r.rpcError, 'expected an error for an unregistered tool');
+});
+
+// --- get_job ------------------------------------------------------------
+
+// get_job is load-bearing beyond its own surface: find_similar_jobs resolves a
+// handle to an id through it, so a get_job outage breaks similar-jobs too.
+test('get_job returns the requested job, addressed by handle (live — soft)', async (t) => {
+  let sid, handle, handleSearchText = '';
+  try {
+    sid = await session();
+    const s = await callTool(sid, 'search_jobs', { query: 'engineer', per_page: 3 });
+    handleSearchText = s.text;
+    handle = (s.text.match(/^\s*ID:\s*(\S+)$/m) ?? [])[1];
+  } catch (err) {
+    t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+    return;
+  }
+  if (QUOTA_EXHAUSTED.test(handleSearchText)) {
+    t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
+    return;
+  }
+  assert.ok(handle, 'search_jobs returned no handle to look up');
+
+  const r = await callTool(sid, 'get_job', { job_id: handle });
+  if (skipIfQuotaExhausted(t, r)) return;
+  assert.ok(!r.isError, `get_job errored: ${r.text}`);
+
+  // Assert against the STRUCTURED HEADER only, not the whole body. get_job
+  // appends the raw job description after a `---` rule, and real postings
+  // routinely contain the words "Location:" / "Salary:" in their prose -- an
+  // earlier version of this test matched those and passed even with the
+  // structured fields renamed. Splitting on the rule is what makes it real.
+  const [header, ...rest] = r.text.split(/\n---\n/);
+  assert.ok(rest.length, `get_job output has no --- rule separating header from description:\n${r.text.slice(0, 300)}`);
+  for (const field of ['Location:', 'Salary:', 'Seniority:', 'Skills:', 'Type:', 'Apply:']) {
+    assert.ok(header.includes(field), `get_job header missing "${field}":\n${header.slice(0, 300)}`);
+  }
+  // The title line identifies which job came back.
+  assert.match(header, /^\*\*.+\*\* at .+/, `get_job header missing the "**Title** at Company" line:\n${header.slice(0, 200)}`);
+});
+
+test('get_job rejects an unknown handle with a real error (live — soft)', async (t) => {
+  let sid;
+  try { sid = await session(); } catch (err) {
+    t.diagnostic(`skipped: ${err.message}`); return;
+  }
+  const r = await callTool(sid, 'get_job', { job_id: 'definitely-not-a-real-job-handle-zzzz' });
+  assert.ok(r.isError, `expected isError for an unknown handle, got:\n${r.text.slice(0, 200)}`);
+});
+
+// --- get_company --------------------------------------------------------
+
+test('get_company returns the requested company (live — soft)', async (t) => {
+  let sid;
+  try { sid = await session(); } catch (err) {
+    t.diagnostic(`skipped: ${err.message}`); return;
+  }
+  const r = await callTool(sid, 'get_company', { company: 'stripe.com' });
+  if (skipIfQuotaExhausted(t, r)) return;
+  assert.ok(!r.isError, `get_company errored: ${r.text}`);
+  // Must return the company that was ASKED FOR — a tool that returns some
+  // other company's profile is worse than one that errors.
+  assert.match(r.text, /stripe\.com/i, `get_company did not return stripe.com:\n${r.text.slice(0, 300)}`);
+  assert.ok(r.text.includes('Open jobs:') || r.text.includes('Industry:'),
+    `get_company output missing profile fields:\n${r.text.slice(0, 300)}`);
+});
+
+test('get_company rejects an unknown domain with a real error (live — soft)', async (t) => {
+  let sid;
+  try { sid = await session(); } catch (err) {
+    t.diagnostic(`skipped: ${err.message}`); return;
+  }
+  const r = await callTool(sid, 'get_company', { company: 'not-a-real-company-zzzz.invalid' });
+  assert.ok(r.isError, `expected isError for an unknown domain, got:\n${r.text.slice(0, 200)}`);
+});
+
+// --- get_filter_options -------------------------------------------------
+
+test('get_filter_options returns facets with counts (live — soft)', async (t) => {
+  let sid;
+  try { sid = await session(); } catch (err) {
+    t.diagnostic(`skipped: ${err.message}`); return;
+  }
+  const r = await callTool(sid, 'get_filter_options', {});
+  if (skipIfQuotaExhausted(t, r)) return;
+  assert.ok(!r.isError, `get_filter_options errored: ${r.text}`);
+  // The whole point of this tool is telling a caller which values are valid,
+  // so an empty facet list is a silent failure, not an empty result.
+  const entries = [...r.text.matchAll(/^\s*-\s+(\S.*?)\s+\(([\d,]+) jobs\)$/gm)];
+  assert.ok(entries.length >= 5, `expected several facet values, got ${entries.length}:\n${r.text.slice(0, 300)}`);
+  assert.ok(entries.some(([, , count]) => Number(count.replace(/,/g, '')) > 0), 'all facet counts were zero');
+  // The default facet set is part of the contract with the search filters.
+  assert.match(r.text, /\*\*employment_type:\*\*/, 'default facets missing employment_type');
+});
+
+test('get_filter_options honours an explicit facet list (live — soft)', async (t) => {
+  let sid;
+  try { sid = await session(); } catch (err) {
+    t.diagnostic(`skipped: ${err.message}`); return;
+  }
+  const r = await callTool(sid, 'get_filter_options', { facets: 'remote_type' });
+  if (skipIfQuotaExhausted(t, r)) return;
+  assert.ok(!r.isError, `get_filter_options errored: ${r.text}`);
+  assert.match(r.text, /\*\*remote_type:\*\*/, `requested facet not returned:\n${r.text.slice(0, 200)}`);
+  assert.ok(!r.text.includes('**seniority:**'), 'returned facets that were not requested');
+});
+
+// --- search_jobs behaviour ----------------------------------------------
+
+test('search_jobs honours per_page (live — soft)', async (t) => {
+  let sid;
+  try { sid = await session(); } catch (err) {
+    t.diagnostic(`skipped: ${err.message}`); return;
+  }
+  const r = await callTool(sid, 'search_jobs', { query: 'engineer', per_page: 3 });
+  if (skipIfQuotaExhausted(t, r)) return;
+  assert.ok(!r.isError, `search_jobs errored: ${r.text}`);
+  const results = [...r.text.matchAll(/^\d+\.\s+\*\*/gm)];
+  assert.ok(results.length > 0 && results.length <= 3,
+    `expected 1..3 results for per_page=3, got ${results.length}`);
+});
+
+// An impossible filter must produce the guidance message, not an error and not
+// a silently empty body.
+test('search_jobs explains itself when filters match nothing (live — soft)', async (t) => {
+  let sid;
+  try { sid = await session(); } catch (err) {
+    t.diagnostic(`skipped: ${err.message}`); return;
+  }
+  const r = await callTool(sid, 'search_jobs', {
+    query: 'zzzqqxunlikelykeyword', salary_min: 990, per_page: 5,
+  });
+  if (skipIfQuotaExhausted(t, r)) return;
+  assert.ok(!r.isError, `search_jobs errored on an empty result set: ${r.text}`);
+  assert.match(r.text, /No jobs found matching your filters/,
+    `expected the no-results guidance, got:\n${r.text.slice(0, 300)}`);
+});
+
+// Invalid enum values must be rejected by the schema rather than silently
+// dropped, which would return unfiltered results a caller would trust.
+test('search_jobs rejects an invalid remote_type instead of ignoring it', async () => {
+  const sid = await session();
+  const r = await callTool(sid, 'search_jobs', { query: 'engineer', remote_type: 'remote', per_page: 2 });
+  assert.ok(r.isError || r.rpcError,
+    `"remote" is not in the enum (fully_remote|hybrid|on_site) and must be rejected, got:\n${r.text.slice(0, 200)}`);
+});
+
+// --- cross-tool chaining -------------------------------------------------
+
+// The handles search_jobs prints must be accepted by the tools that consume
+// them. This is the contract that broke find_similar_jobs: search_jobs labels
+// the handle "ID:", and similar_to only accepted the raw id.
+test('handles from search_jobs are accepted by get_job and find_similar_jobs (live — soft)', async (t) => {
+  let sid, handles, chainSearchText = '';
+  try {
+    sid = await session();
+    const s = await callTool(sid, 'search_jobs', { query: 'software engineer', remote_type: 'fully_remote', per_page: 3 });
+    chainSearchText = s.text;
+    handles = [...s.text.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
+  } catch (err) {
+    t.diagnostic(`live API check skipped (network/env): ${err.message}`);
+    return;
+  }
+  if (QUOTA_EXHAUSTED.test(chainSearchText)) {
+    t.diagnostic('JDL free-tier quota exhausted for this IP — skipping live assertion');
+    return;
+  }
+  assert.ok(handles.length, 'search_jobs returned no handles');
+
+  const handle = handles[0];
+  const job = await callTool(sid, 'get_job', { job_id: handle });
+  assert.ok(!job.isError, `get_job rejected a handle from search_jobs: ${job.text}`);
+
+  const similar = await callTool(sid, 'find_similar_jobs', { job_id: handle, per_page: 3 });
+  assert.ok(!similar.isError, `find_similar_jobs rejected a handle from search_jobs: ${similar.text}`);
+
+  // Handles returned by find_similar_jobs must round-trip too.
+  const nested = [...similar.text.matchAll(/^\s*ID:\s*(\S+)$/gm)].map((m) => m[1]);
+  if (nested.length) {
+    const back = await callTool(sid, 'get_job', { job_id: nested[0] });
+    assert.ok(!back.isError, `a handle from find_similar_jobs was rejected by get_job: ${back.text}`);
+  }
+});
+
+// The free-tier banner is prepended to every response in free mode, and
+// production runs in free mode (no JDL_API_KEY on the Cloud Run service). It
+// must not run into the content: before this was fixed, every response read
+// "...free calls remaining todayFound 224,511 jobs (showing 1)".
+test('the free-tier banner is separated from the response body (live — soft)', async (t) => {
+  let sid;
+  try { sid = await session(); } catch (err) {
+    t.diagnostic(`skipped: ${err.message}`); return;
+  }
+  const r = await callTool(sid, 'search_jobs', { query: 'engineer', per_page: 1 });
+  if (skipIfQuotaExhausted(t, r)) return;
+  assert.ok(!r.isError, `search_jobs errored: ${r.text}`);
+  if (!/free calls remaining|Daily free limit/.test(r.raw)) {
+    t.diagnostic('not in free mode — banner assertion not applicable');
+    return;
+  }
+  assert.match(r.raw, /(remaining today|jobdatalake\.com)\s*\n/,
+    `banner runs into the body:\n${JSON.stringify(r.raw.slice(0, 160))}`);
+  // And the body must survive intact rather than being glued to the banner.
+  assert.match(r.text, /^Found [\d,]+ jobs/,
+    `body did not start cleanly after the banner:\n${JSON.stringify(r.text.slice(0, 160))}`);
+});

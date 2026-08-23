@@ -13,7 +13,7 @@ const isFreeMode = apiKey === MCP_FREE_KEY;
 
 const client = new JDLClient(apiKey);
 
-const CONTINENT_MAP: Record<string, string> = {
+export const CONTINENT_MAP: Record<string, string> = {
   'europe': 'DE,GB,FR,NL,ES,IT,SE,PL,IE,CH,AT,BE,DK,NO,FI,PT,CZ,RO,HU,GR',
   'asia': 'JP,CN,IN,KR,SG,TW,HK,TH,VN,PH,MY,ID',
   'latin america': 'BR,MX,AR,CO,CL,PE,UY',
@@ -29,7 +29,7 @@ const CONTINENT_MAP: Record<string, string> = {
   'emea': 'DE,GB,FR,NL,ES,IT,SE,PL,IE,CH,AT,BE,DK,NO,FI,PT,CZ,RO,HU,GR,AE,IL,SA,ZA,NG,KE,EG',
 };
 
-function formatSalary(min: number | undefined, max: number | undefined): string {
+export function formatSalary(min: number | undefined, max: number | undefined): string {
   // Filter out obviously wrong values (non-USD or absurd amounts)
   const validMin = min && min >= 10 && min <= 1000 ? min : undefined;
   const validMax = max && max >= 10 && max <= 1000 ? max : undefined;
@@ -37,11 +37,14 @@ function formatSalary(min: number | undefined, max: number | undefined): string 
   return `$${validMin || '?'}k - $${validMax || '?'}k`;
 }
 
+// Callers append tool output directly after this banner, so it must end with a
+// separator of its own. Without the trailing newlines every free-tier response
+// read "...free calls remaining todayFound 224,511 jobs (showing 1)".
 function mcpWarning(remaining?: number): string {
   if (!isFreeMode || remaining === undefined) return '';
-  if (remaining <= 0) return '\n\n⚠️ Daily free limit reached. Get unlimited access with your own API key at jobdatalake.com';
-  if (remaining <= 50) return `\n\n⚠️ ${remaining}/500 free calls remaining today. Get unlimited access at jobdatalake.com`;
-  return `\n\n📊 ${remaining}/500 free calls remaining today`;
+  if (remaining <= 0) return '⚠️ Daily free limit reached. Get unlimited access with your own API key at jobdatalake.com\n\n';
+  if (remaining <= 50) return `⚠️ ${remaining}/500 free calls remaining today. Get unlimited access at jobdatalake.com\n\n`;
+  return `📊 ${remaining}/500 free calls remaining today\n\n`;
 }
 
 export function createServer(): McpServer {
@@ -77,7 +80,7 @@ server.tool(
   },
   // Read-only, fetches live external data. Required by MCP hosts' review
   // (e.g. the ChatGPT app directory) and clarifies safety for every client.
-  { readOnlyHint: true, openWorldHint: true },
+  { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     const params: Record<string, string> = {};
     if (args.query) params.q = args.query;
@@ -161,7 +164,7 @@ server.tool(
   {
     job_id: z.string().describe('Job handle from search results (e.g. "dropbox-senior-full-stack-software-engineer-d3f1k")'),
   },
-  { readOnlyHint: true, openWorldHint: true },
+  { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     try {
       const result = await client.getJob(args.job_id);
@@ -192,7 +195,7 @@ server.tool(
   {
     company: z.string().describe('Company domain (e.g. "stripe.com") or handle'),
   },
-  { readOnlyHint: true, openWorldHint: true },
+  { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     try {
       const result = await client.getCompany(args.company);
@@ -228,7 +231,7 @@ server.tool(
     job_id: z.string().describe('Job handle from search results (e.g. "dropbox-senior-full-stack-software-engineer-d3f1k")'),
     per_page: z.number().optional().default(10).describe('Number of results'),
   },
-  { readOnlyHint: true, openWorldHint: true },
+  { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     let similarTo = args.job_id;
 
@@ -291,7 +294,7 @@ server.tool(
   {
     facets: z.string().optional().default('seniority,job_function,remote_type,employment_type,required_skills').describe('Comma-separated facet fields to retrieve'),
   },
-  { readOnlyHint: true, openWorldHint: true },
+  { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     try {
       const result = await client.searchJobs({ q: '*', per_page: '0', facets: args.facets ?? 'seniority,job_function,remote_type,employment_type,required_skills' });
