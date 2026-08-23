@@ -49,7 +49,11 @@ jobs:
           name: Build Docker image
           command: |
             export CLOUDSDK_PYTHON=/usr/bin/python3
-            echo 'export PATH=~$PATH:~/.local/bin' >> $BASH_ENV
+            # NOT 'export PATH=~$PATH:...' -- that glues a literal ~ onto the
+            # first existing PATH entry (PATH=~/usr/local/bin:...). Copied from
+            # the jobdatalake config, where it works only because the binaries
+            # happen to live in later entries.
+            echo 'export PATH="$PATH:$HOME/.local/bin"' >> $BASH_ENV
             echo ${GCP_PROJECT_KEY} | base64 --decode --ignore-garbage > $HOME/gcloud-service-key.json
             echo 'export GOOGLE_CLOUD_KEYS=$(cat $HOME/gcloud-service-key.json)' >> $BASH_ENV
             echo 'export TAG=${CIRCLE_SHA1}' >> $BASH_ENV
@@ -79,6 +83,32 @@ jobs:
           region: "us-central1"
           # Public MCP endpoint — Claude and ChatGPT connect unauthenticated.
           unauthenticated: true
+
+      # Post-deploy smoke check. The deploy job going green only means Cloud Run
+      # accepted the revision; it does not mean the service answers. The marquee
+      # incident in this repo was the MCP endpoint 404ing at the ROOT path while
+      # everything else looked healthy, so check exactly that, against the real
+      # domain, after traffic has shifted.
+      - run:
+          name: Smoke check the deployed revision
+          command: |
+            set -euo pipefail
+            BASE="https://mcp.jobdatalake.com"
+            for i in $(seq 1 10); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/health" || true)
+              [ "$code" = "200" ] && break
+              echo "health not ready (got ${code:-none}), retry $i"; sleep 6
+            done
+            [ "$code" = "200" ] || { echo "FAIL: /health returned $code"; exit 1; }
+
+            # MCP initialize over the ROOT path — what Claude actually does.
+            root=$(curl -s -o /tmp/mcp.out -w '%{http_code}' -X POST "$BASE/" \
+              -H 'content-type: application/json' \
+              -H 'accept: application/json, text/event-stream' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}')
+            grep -q 'jobdatalake' /tmp/mcp.out \
+              || { echo "FAIL: root MCP initialize returned $root"; head -c 400 /tmp/mcp.out; exit 1; }
+            echo "smoke check passed: /health 200, root MCP initialize OK"
 
 workflows:
   mcp-server:
