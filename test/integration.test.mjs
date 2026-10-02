@@ -12,6 +12,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { readFile } from 'node:fs/promises';
 
 const PORT = Number(process.env.TEST_PORT || 8090);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -668,4 +669,59 @@ test('abandoned sessions are tracked exactly, not double-counted', async () => {
   }
   const after = (await (await fetch(`${BASE}/health`)).json()).sessions;
   assert.equal(after, before, `sessions leaked: ${after - before} left after cleanup`);
+});
+
+// The session cap must be low enough that MAX_SESSIONS worth of live sessions
+// fits in the container's memory limit. The first version of these constants
+// (30 min idle, cap 500) allowed ~300 live sessions against a 256 MiB limit at
+// the measured arrival rate of ~10 sessions/min, and the service OOM-killed
+// ~100x/day. Measured cost: 46 live sessions ~= 166 MB RSS, i.e. roughly
+// 2.5 MB/session on top of a ~50 MB baseline.
+test('session limits are sized to fit the container memory budget', async () => {
+  const src = await readFile(new URL('../src/http.ts', import.meta.url), 'utf8');
+  // Resolve constants in dependency order: MAX_SESSIONS is an expression over
+  // the others, so substitute already-known names before evaluating it.
+  const known = {};
+  const num = (name) => {
+    if (name in known) return known[name];
+    const m = src.match(new RegExp(`const ${name} = ([^;]+);`));
+    assert.ok(m, `${name} not found in src/http.ts`);
+    let expr = m[1];
+    for (const [k, v] of Object.entries(known)) {
+      expr = expr.replace(new RegExp(`\\b${k}\\b`, 'g'), String(v));
+    }
+    // Any identifier left is a constant we have not resolved yet.
+    const unresolved = expr.match(/\b[A-Z][A-Z0-9_]{2,}\b/g);
+    for (const dep of unresolved ?? []) {
+      known[dep] = num(dep);
+      expr = expr.replace(new RegExp(`\\b${dep}\\b`, 'g'), String(known[dep]));
+    }
+    // eslint-disable-next-line no-eval
+    const value = eval(expr);
+    assert.equal(typeof value, 'number', `${name} did not resolve to a number`);
+    known[name] = value;
+    return value;
+  };
+  const idleMs = num('SESSION_IDLE_MS');
+  const sweepMs = num('SESSION_SWEEP_MS');
+  const maxSessions = num('MAX_SESSIONS');
+
+  // Sweep must be well inside the idle window or reaping lags badly.
+  assert.ok(sweepMs <= idleMs / 4,
+    `sweep ${sweepMs}ms is too coarse for a ${idleMs}ms idle window`);
+
+  // At the measured ~10 sessions/min arrival rate, steady state is
+  // (idle minutes * 10). Keep that under the cap, and the cap within budget.
+  const steadyState = (idleMs / 60000) * 10;
+  assert.ok(steadyState <= maxSessions,
+    `idle window implies ~${steadyState} live sessions, above MAX_SESSIONS=${maxSessions}`);
+
+  // MAX_SESSIONS is derived from the declared container budget, so the only way
+  // this fails is if someone hardcodes a cap that the memory limit cannot hold.
+  const limitMb = num('CONTAINER_MEMORY_MB');
+  const baselineMb = num('BASELINE_MB');
+  const mbPerSession = num('MB_PER_SESSION');
+  const worstCaseMb = baselineMb + maxSessions * mbPerSession;
+  assert.ok(worstCaseMb <= limitMb,
+    `MAX_SESSIONS=${maxSessions} implies ~${worstCaseMb}MB worst case, over the ${limitMb}MB limit`);
 });

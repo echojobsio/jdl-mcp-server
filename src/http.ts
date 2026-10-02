@@ -54,9 +54,31 @@ app.get('/health', (_req: Request, res: Response) => {
 //
 // That leak OOM-killed the container ~80x/day against a 256 MiB limit, and any
 // request that landed on an instance mid-kill returned 503 to a real user.
-const SESSION_IDLE_MS = 30 * 60 * 1000; // 30 min with no requests -> reap
-const SESSION_SWEEP_MS = 5 * 60 * 1000; // check every 5 min
-const MAX_SESSIONS = 500;               // backstop against a burst
+// Sized from MEASURED arrival rate, not a guess. Production receives roughly
+// 10 new sessions/minute, so the first version of these numbers (30 min idle,
+// 500 cap) allowed ~300 live sessions -- far past what fits in the container,
+// which OOM-killed ~100x/day while the reaper sat waiting for the window.
+//
+// Each session holds a full McpServer (createServer() per session), so live
+// session count is the memory driver. At ~10/min:
+//   5 min idle  -> ~50 live sessions steady state
+//   measured: 46 sessions ~= 166 MB RSS
+// MAX_SESSIONS is the hard ceiling that keeps RSS bounded even if arrivals
+// spike; it drops the least-recently-used rather than growing.
+const SESSION_IDLE_MS = 5 * 60 * 1000;  // 5 min with no requests -> reap
+const SESSION_SWEEP_MS = 30 * 1000;     // check every 30s
+
+// MUST match the Cloud Run --memory setting for this service. Deriving the
+// session ceiling from it keeps the two from drifting apart: raise the Cloud
+// Run limit and this constant together, and MAX_SESSIONS scales with it.
+const CONTAINER_MEMORY_MB = 256;
+const BASELINE_MB = 50;        // Node + app, measured at boot
+const MB_PER_SESSION = 2.5;    // measured: 46 live sessions ~= 166 MB RSS
+const HEADROOM = 0.8;          // leave room for request-time allocation
+
+// Hard ceiling on live sessions, so RSS stays bounded even if arrivals spike.
+// Beyond it the least-recently-used session is dropped rather than growing.
+const MAX_SESSIONS = Math.floor((CONTAINER_MEMORY_MB * HEADROOM - BASELINE_MB) / MB_PER_SESSION);
 
 interface Session {
   transport: StreamableHTTPServerTransport;
