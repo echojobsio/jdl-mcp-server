@@ -2,20 +2,20 @@
 // mcp.jobdatalake.com). Streamable HTTP is the transport recommended by MCP
 // hosts including the ChatGPT app/plugin directory.
 //
-// Stateful sessions: the MCP handshake is initialize -> (session id) ->
-// tools/list -> tools/call, and that state must persist across the separate
-// HTTP requests a client makes. We issue a session id on initialize and keep
-// the transport in memory keyed by it.
+// Stateless: every POST gets a fresh McpServer + transport and nothing
+// survives the request. All five tools are read-only and the server never
+// pushes to the client, so there is no state worth keeping between requests.
 //
-// Cloud Run note: because sessions live in-memory, enable **session affinity**
-// on the Cloud Run service so a client's follow-up requests reach the same
-// instance. (Read-only search tools mean a dropped session just forces a
-// re-initialize, so this is low-risk even if affinity lapses.)
+// It used to be stateful (session id -> transport, in memory), and that broke
+// real clients: any restart, idle reap or request routed to another Cloud Run
+// instance left the client holding a session id the server no longer knew,
+// and the server answered 400 "no valid session id". The spec only tells
+// clients to re-initialize on 404, so they failed outright instead -- the
+// Claude connector went dead until a manual reconnect. Held sessions were also
+// the memory driver behind the OOM kills. Stateless removes both.
 import express, { type Request, type Response } from 'express';
-import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createServer } from './server.js';
 
 const app = express();
@@ -25,17 +25,18 @@ app.use(express.json());
 // for an HTTP response, unlike transport.onclose for an abandoned POST session).
 const sseTransports: Record<string, SSEServerTransport> = {};
 
-// Health check for Cloud Run and uptime monitors.
-//
-// Reports live session counts and heap use: the leak that OOM-killed this
-// service ~80x/day was invisible from outside, and the 503s it caused looked
-// like a flaky endpoint rather than a container being reaped. `sessions` going
-// up and never coming down is the signal.
+// Streamable HTTP requests currently being handled. Stateless, so this falls
+// back to zero between requests; a number that only climbs means a leak.
+let inFlight = 0;
+
+// Health check for Cloud Run and uptime monitors. Heap and RSS are here because
+// the old session leak OOM-killed this service ~80x/day while looking like a
+// flaky endpoint from outside.
 app.get('/health', (_req: Request, res: Response) => {
   const mem = process.memoryUsage();
   res.json({
     status: 'ok',
-    sessions: sessions.size,
+    inFlight,
     sseSessions: Object.keys(sseTransports).length,
     heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
     rssMb: Math.round(mem.rss / 1024 / 1024),
@@ -43,109 +44,49 @@ app.get('/health', (_req: Request, res: Response) => {
   });
 });
 
-// Live sessions: session id -> transport + last activity.
-//
-// These MUST be evicted on a timer, not only via transport.onclose. onclose
-// fires when a client explicitly closes (DELETE, or the stream ending); clients
-// that simply stop talking -- the Claude connector, directory health checkers
-// that probe hourly, one-shot CLI probes -- never trigger it. Every abandoned
-// session then pins a transport AND a full McpServer (createServer() builds one
-// per session, with all five tools and their zod schemas).
-//
-// That leak OOM-killed the container ~80x/day against a 256 MiB limit, and any
-// request that landed on an instance mid-kill returned 503 to a real user.
-const SESSION_IDLE_MS = 30 * 60 * 1000; // 30 min with no requests -> reap
-const SESSION_SWEEP_MS = 5 * 60 * 1000; // check every 5 min
-const MAX_SESSIONS = 500;               // backstop against a burst
-
-interface Session {
-  transport: StreamableHTTPServerTransport;
-  lastSeen: number;
-}
-const sessions = new Map<string, Session>();
-
-function touch(sessionId: string): void {
-  const s = sessions.get(sessionId);
-  if (s) s.lastSeen = Date.now();
-}
-
-async function dropSession(sessionId: string, reason: string): Promise<void> {
-  const s = sessions.get(sessionId);
-  if (!s) return;
-  sessions.delete(sessionId);
-  try {
-    await s.transport.close();
-  } catch (err) {
-    console.error(`session ${sessionId} close failed (${reason}):`, err);
-  }
-}
-
-// Reap idle sessions. unref() so the timer never holds the process open.
-const sweeper = setInterval(() => {
-  const cutoff = Date.now() - SESSION_IDLE_MS;
-  for (const [id, s] of sessions) {
-    if (s.lastSeen < cutoff) void dropSession(id, 'idle');
-  }
-}, SESSION_SWEEP_MS);
-sweeper.unref();
-
 // Serve the Streamable HTTP endpoint at BOTH the root path and /mcp. The
 // existing Claude connector (and the Claude directory listing) connect at the
 // ROOT of mcp.jobdatalake.com; ChatGPT/newer clients use /mcp. Serving both
 // keeps every client working. (Regression fix: an earlier version only served
 // /mcp, so root returned 404 and Claude could not connect.)
+//
+// A client may still send an mcp-session-id it got from the old stateful
+// server; stateless transports ignore it, so those clients just keep working.
 app.post(['/', '/mcp'], async (req: Request, res: Response) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  let transport: StreamableHTTPServerTransport;
-
-  if (sessionId && sessions.has(sessionId)) {
-    // Existing session.
-    transport = sessions.get(sessionId)!.transport;
-    touch(sessionId);
-  } else if (!sessionId && isInitializeRequest(req.body)) {
-    // Backstop: if a burst outruns the sweeper, reap the least-recently-used
-    // rather than accepting unbounded growth toward another OOM.
-    if (sessions.size >= MAX_SESSIONS) {
-      const oldest = [...sessions.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen)[0];
-      if (oldest) await dropSession(oldest[0], 'max sessions');
-    }
-    // New session: create a transport + a fresh server, register on init.
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (sid) => {
-        sessions.set(sid, { transport, lastSeen: Date.now() });
-      },
-    });
-    transport.onclose = () => {
-      if (transport.sessionId) sessions.delete(transport.sessionId);
-    };
-    const server = createServer();
+  const server = createServer();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  inFlight++;
+  res.on('close', () => {
+    inFlight--;
+    void transport.close();
+    void server.close();
+  });
+  try {
     await server.connect(transport);
-  } else {
-    res.status(400).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Bad Request: no valid session id (initialize first)' },
-      id: null,
-    });
-    return;
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('MCP request failed:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null,
+      });
+    }
   }
-
-  await transport.handleRequest(req, res, req.body);
 });
 
-// GET = server->client SSE stream; DELETE = terminate — both need a live session.
-const handleSession = async (req: Request, res: Response) => {
-  const sessionId = req.headers['mcp-session-id'] as string | undefined;
-  const session = sessionId ? sessions.get(sessionId) : undefined;
-  if (!session) {
-    res.status(400).send('Invalid or missing session id');
-    return;
-  }
-  touch(sessionId!);
-  await session.transport.handleRequest(req, res);
+// No sessions means no server->client stream to open (GET) and nothing to
+// terminate (DELETE). 405 is the spec's answer for both.
+const methodNotAllowed = (_req: Request, res: Response) => {
+  res.status(405).set('Allow', 'POST').json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Method not allowed.' },
+    id: null,
+  });
 };
-app.get(['/', '/mcp'], handleSession);
-app.delete(['/', '/mcp'], handleSession);
+app.get(['/', '/mcp'], methodNotAllowed);
+app.delete(['/', '/mcp'], methodNotAllowed);
 
 // --- Legacy SSE transport (backward compatibility) -------------------------
 // The Claude connector directory and existing remote clients connect over SSE

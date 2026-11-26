@@ -603,69 +603,82 @@ test('the free-tier banner is separated from the response body (live — soft)',
 });
 
 // ---------------------------------------------------------------------------
-// Session lifecycle
+// Stateless transport
 //
-// Sessions used to be evicted ONLY by transport.onclose, which fires when a
-// client explicitly closes. Clients that just stop talking -- the Claude
-// connector, directory health checkers probing hourly, one-shot CLI probes --
-// never trigger it, and each abandoned session pinned a transport AND a full
-// McpServer (createServer() builds one per session). The container OOM-killed
-// ~80x/day against a 256 MiB limit; every request landing on an instance
-// mid-kill returned 503 to a real user.
+// The server used to keep sessions in memory. Any restart, idle reap or request
+// routed to another Cloud Run instance left clients holding a session id the
+// server no longer knew; it answered 400, clients only re-initialize on 404,
+// and the Claude connector went dead until a manual reconnect. These tests pin
+// the stateless behavior that replaced it.
 // ---------------------------------------------------------------------------
 
-test('/health reports live session and memory state', async () => {
+test('/health reports request and memory state', async () => {
   const r = await fetch(`${BASE}/health`);
   assert.equal(r.status, 200);
   const body = await r.json();
   assert.equal(body.status, 'ok');
-  // Without these the leak is invisible from outside -- which is why it ran for
-  // days looking like a flaky endpoint.
-  for (const field of ['sessions', 'sseSessions', 'heapUsedMb', 'rssMb', 'uptimeSec']) {
+  for (const field of ['inFlight', 'sseSessions', 'heapUsedMb', 'rssMb', 'uptimeSec']) {
     assert.equal(typeof body[field], 'number', `/health missing numeric "${field}"`);
   }
 });
 
-test('initialize registers a session and DELETE releases it', async () => {
-  const before = (await (await fetch(`${BASE}/health`)).json()).sessions;
-
-  const { sid } = await rpc('/', INIT);
-  await rpc('/', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
-  assert.ok(sid, 'no session id issued');
-
-  const during = (await (await fetch(`${BASE}/health`)).json()).sessions;
-  assert.equal(during, before + 1, 'initialize did not register exactly one session');
-
-  const del = await fetch(`${BASE}/`, { method: 'DELETE', headers: { 'mcp-session-id': sid } });
-  assert.ok(del.status < 500, `DELETE failed: ${del.status}`);
-
-  const after = (await (await fetch(`${BASE}/health`)).json()).sessions;
-  assert.equal(after, before, 'session was not released on DELETE');
+test('initialize issues no session id', async () => {
+  const res = await fetch(`${BASE}/`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify(INIT),
+  });
+  await res.text();
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('mcp-session-id'), null, 'stateless server must not issue a session id');
 });
 
-// The leak itself: sessions a client never closes must not accumulate forever.
-// Reaping is time-based, so this asserts the accounting is exact rather than
-// waiting out the 30-minute idle window.
-test('abandoned sessions are tracked exactly, not double-counted', async () => {
-  const before = (await (await fetch(`${BASE}/health`)).json()).sessions;
+// The bug itself: a client still holding an id from a server that has since
+// restarted must keep working, not get "no valid session id".
+test('a stale session id from a previous server still works', async () => {
+  const r = await rpc('/', { jsonrpc: '2.0', id: 7, method: 'tools/list', params: {} },
+    'session-from-a-server-that-restarted');
+  assert.equal(r.status, 200, `stale session id rejected: ${JSON.stringify(r.json)}`);
+  assert.ok(r.json?.result?.tools?.length >= 5, 'tools/list did not return the tools');
+});
 
-  const ids = [];
+// Same, for an actual tool call. Uses an argument that fails schema validation
+// so the test reaches the tool handler without spending free-tier quota.
+test('tools/call with a stale session id reaches the tool', async () => {
+  const r = await rpc('/', {
+    jsonrpc: '2.0', id: 10, method: 'tools/call',
+    params: { name: 'search_jobs', arguments: { query: 'engineer', remote_type: 'remote' } },
+  }, 'session-from-a-server-that-restarted');
+  assert.equal(r.status, 200, `stale session id rejected: ${JSON.stringify(r.json)}`);
+  assert.ok(r.json?.result?.isError || r.json?.error,
+    `expected the tool's validation error, got: ${JSON.stringify(r.json).slice(0, 200)}`);
+  assert.doesNotMatch(JSON.stringify(r.json), /no valid session id/);
+});
+
+test('tools/list works without a prior initialize', async () => {
+  const r = await rpc('/mcp', { jsonrpc: '2.0', id: 8, method: 'tools/list', params: {} });
+  assert.equal(r.status, 200);
+  assert.ok(r.json?.result?.tools?.length >= 5);
+});
+
+test('GET and DELETE on the endpoint return 405', async () => {
+  for (const method of ['GET', 'DELETE']) {
+    for (const path of ['/', '/mcp']) {
+      const r = await fetch(`${BASE}${path}`, { method, headers: { accept: 'text/event-stream' } });
+      await r.text();
+      assert.equal(r.status, 405, `${method} ${path} returned ${r.status}`);
+    }
+  }
+});
+
+// Nothing may outlive its request: the old per-session McpServer is what
+// OOM-killed the container.
+test('nothing is held after requests finish', async () => {
   for (let i = 0; i < 5; i++) {
-    const { sid } = await rpc('/', INIT);
-    await rpc('/', { jsonrpc: '2.0', method: 'notifications/initialized' }, sid);
-    ids.push(sid);
+    await rpc('/', INIT);
+    await rpc('/', { jsonrpc: '2.0', id: 9, method: 'tools/list', params: {} });
   }
-  const peak = (await (await fetch(`${BASE}/health`)).json()).sessions;
-  assert.equal(peak, before + 5, `expected 5 new sessions, got ${peak - before}`);
-
-  // Reusing a session must not create another one.
-  await rpc('/', { jsonrpc: '2.0', id: 99, method: 'tools/list', params: {} }, ids[0]);
-  const afterReuse = (await (await fetch(`${BASE}/health`)).json()).sessions;
-  assert.equal(afterReuse, peak, 'reusing a session id created a new session');
-
-  for (const sid of ids) {
-    await fetch(`${BASE}/`, { method: 'DELETE', headers: { 'mcp-session-id': sid } });
-  }
-  const after = (await (await fetch(`${BASE}/health`)).json()).sessions;
-  assert.equal(after, before, `sessions leaked: ${after - before} left after cleanup`);
+  await sleep(50);
+  const body = await (await fetch(`${BASE}/health`)).json();
+  assert.equal(body.inFlight, 0, `requests still held: ${body.inFlight}`);
 });
