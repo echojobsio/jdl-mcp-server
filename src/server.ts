@@ -47,6 +47,46 @@ function mcpWarning(remaining?: number): string {
   return `📊 ${remaining}/500 free calls remaining today\n\n`;
 }
 
+// Tool input schemas live at module scope so every server shares them. The
+// hosted HTTP entry builds a fresh server per request (it is stateless), and
+// rebuilding these zod schemas each time was most of the ~0.6 MB a request
+// allocated -- real memory pressure on a 256 MiB container under a burst.
+const searchJobsShape = {
+  query: z.string().optional().describe('Keyword search (title, company, skills). Use * for all jobs.'),
+  semantic_query: z.string().optional().describe('AI semantic search. Works best with job-title-like queries (e.g. "machine learning engineer", "senior devops"). Supported for remote + tech jobs only.'),
+  location: z.string().optional().describe('Location filter, e.g. "Remote", "San Francisco", "Germany"'),
+  remote_type: z.enum(['fully_remote', 'hybrid', 'on_site']).optional().describe('Remote work policy'),
+  countries: z.string().optional().describe('Comma-separated ISO country codes, e.g. "US,GB,DE"'),
+  job_function: z.enum(['eng', 'data', 'design', 'sales', 'ops', 'marketing', 'security', 'product', 'finance', 'hr', 'legal', 'other']).optional(),
+  seniority: z.string().optional().describe('Comma-separated: Entry, Mid Level, Senior, Staff, Principal, Manager, Internship, Director, Lead, C Level'),
+  employment_type: z.enum(['full_time', 'part_time', 'contract', 'internship']).optional(),
+  salary_min: z.number().optional().describe('Minimum annual salary in USD'),
+  salary_max: z.number().optional().describe('Maximum annual salary in USD'),
+  skills: z.string().optional().describe('Comma-separated required skills, e.g. "Python,AWS,Kubernetes"'),
+  company: z.string().optional().describe('Company domain filter, e.g. "stripe.com"'),
+  posted_within: z.string().optional().describe('Time window: "24h", "7d", "30d" — only jobs posted within this period'),
+  sort_by: z.string().optional().describe('Sort: "posted_at:desc" (newest, default), "posted_at:asc" (oldest), "salary_max_usd:desc" (highest paid), "salary_min_usd:asc" (lowest paid)'),
+  page: z.number().optional().default(1),
+  per_page: z.number().optional().default(20).describe('Results per page (max 100)'),
+};
+
+const getJobShape = {
+  job_id: z.string().describe('Job handle from search results (e.g. "dropbox-senior-full-stack-software-engineer-d3f1k")'),
+};
+
+const getCompanyShape = {
+  company: z.string().describe('Company domain (e.g. "stripe.com") or handle'),
+};
+
+const findSimilarJobsShape = {
+  job_id: z.string().describe('Job handle from search results (e.g. "dropbox-senior-full-stack-software-engineer-d3f1k")'),
+  per_page: z.number().optional().default(10).describe('Number of results'),
+};
+
+const getFilterOptionsShape = {
+  facets: z.string().optional().default('seniority,job_function,remote_type,employment_type,required_skills').describe('Comma-separated facet fields to retrieve'),
+};
+
 export function createServer(): McpServer {
 const server = new McpServer({
   name: 'jobdatalake',
@@ -60,24 +100,7 @@ const server = new McpServer({
 server.tool(
   'search_jobs',
   'Search 1M+ job listings from 20K+ companies. Supports keyword search, AI semantic search, filters for location, salary, remote type, seniority, skills, and more.',
-  {
-    query: z.string().optional().describe('Keyword search (title, company, skills). Use * for all jobs.'),
-    semantic_query: z.string().optional().describe('AI semantic search. Works best with job-title-like queries (e.g. "machine learning engineer", "senior devops"). Supported for remote + tech jobs only.'),
-    location: z.string().optional().describe('Location filter, e.g. "Remote", "San Francisco", "Germany"'),
-    remote_type: z.enum(['fully_remote', 'hybrid', 'on_site']).optional().describe('Remote work policy'),
-    countries: z.string().optional().describe('Comma-separated ISO country codes, e.g. "US,GB,DE"'),
-    job_function: z.enum(['eng', 'data', 'design', 'sales', 'ops', 'marketing', 'security', 'product', 'finance', 'hr', 'legal', 'other']).optional(),
-    seniority: z.string().optional().describe('Comma-separated: Entry, Mid Level, Senior, Staff, Principal, Manager, Internship, Director, Lead, C Level'),
-    employment_type: z.enum(['full_time', 'part_time', 'contract', 'internship']).optional(),
-    salary_min: z.number().optional().describe('Minimum annual salary in USD'),
-    salary_max: z.number().optional().describe('Maximum annual salary in USD'),
-    skills: z.string().optional().describe('Comma-separated required skills, e.g. "Python,AWS,Kubernetes"'),
-    company: z.string().optional().describe('Company domain filter, e.g. "stripe.com"'),
-    posted_within: z.string().optional().describe('Time window: "24h", "7d", "30d" — only jobs posted within this period'),
-    sort_by: z.string().optional().describe('Sort: "posted_at:desc" (newest, default), "posted_at:asc" (oldest), "salary_max_usd:desc" (highest paid), "salary_min_usd:asc" (lowest paid)'),
-    page: z.number().optional().default(1),
-    per_page: z.number().optional().default(20).describe('Results per page (max 100)'),
-  },
+  searchJobsShape,
   // Read-only; queries the JobDataLake API only. All three hints are set
   // explicitly because MCP hosts' review (e.g. the ChatGPT app directory) reads
   // them, and chatgpt-app-submission.json must state the same values.
@@ -166,9 +189,7 @@ server.tool(
 server.tool(
   'get_job',
   'Get full details for a specific job listing including description, requirements, salary, and apply link. Use the job_handle ID from search_jobs results.',
-  {
-    job_id: z.string().describe('Job handle from search results (e.g. "dropbox-senior-full-stack-software-engineer-d3f1k")'),
-  },
+  getJobShape,
   { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     try {
@@ -197,9 +218,7 @@ server.tool(
 server.tool(
   'get_company',
   'Get company profile including open job count, industry, size, and career page URL.',
-  {
-    company: z.string().describe('Company domain (e.g. "stripe.com") or handle'),
-  },
+  getCompanyShape,
   { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     try {
@@ -238,10 +257,7 @@ const RAW_JOB_ID = /^[a-f0-9]{24}$/;
 server.tool(
   'find_similar_jobs',
   'Find jobs similar to a given job listing using AI vector similarity. Great for "more like this" discovery.',
-  {
-    job_id: z.string().describe('Job handle from search results (e.g. "dropbox-senior-full-stack-software-engineer-d3f1k")'),
-    per_page: z.number().optional().default(10).describe('Number of results'),
-  },
+  findSimilarJobsShape,
   { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     let similarTo = args.job_id;
@@ -305,9 +321,7 @@ server.tool(
 server.tool(
   'get_filter_options',
   'Get available filter values (seniority levels, job functions, skills, etc.) with job counts. Useful for discovering what values to use in search filters.',
-  {
-    facets: z.string().optional().default('seniority,job_function,remote_type,employment_type,required_skills').describe('Comma-separated facet fields to retrieve'),
-  },
+  getFilterOptionsShape,
   { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
   async (args) => {
     try {
